@@ -1,0 +1,25 @@
+[syntalos_module]
+type = "python"
+
+name = "Polar Verity Sense"
+description = "Streams data from a Polar Verity Sense device."
+icon = "polar-logo.svg"
+
+main = "mod-main.py"
+# will run the module in a dedicated venv with requirements.txt installed
+use_venv = true
+
+# By default development modules don't show up in Syntalos
+# unless you activate the developer mode.
+devel = false
+
+# This will put it inside the "Device Support" group in the "Add Module" GUI
+categories = 'device'
+features = ['show-settings']
+
+[ports]
+
+[[ports.out]]
+data_type = 'IntSignalBlock'
+id = 'packets'
+title = 'Data Packets'
