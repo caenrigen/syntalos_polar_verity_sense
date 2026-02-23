@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, asdict
 import json
 
+import numpy as np
 from bleak import BleakScanner, BleakClient
 from bleak.backends.device import BLEDevice
 
@@ -25,6 +26,7 @@ class State:
     settings: Settings | None = None
     stop_requested: bool = False
 
+    loop: asyncio.AbstractEventLoop | None = None
     client: BleakClient | None = None
 
 
@@ -65,8 +67,17 @@ async def read_battery_level():
 
 def cleanup():
     client = STATE.client
+    loop = STATE.loop
+
     if client and client.is_connected:
-        asyncio.run(client.disconnect())
+        assert loop is not None
+        loop.run_until_complete(client.disconnect())
+
+    if loop is not None and not loop.is_closed():
+        loop.close()
+
+    STATE.client = None
+    STATE.loop = None
     STATE.stop_requested = False
 
 
@@ -82,8 +93,12 @@ out.set_metadata_value("data_unit", ["nanoseconds", "%"])
 
 
 def prepare():
-    client = BleakClient(asyncio.run(scan_for_device()))
-    asyncio.run(client.connect())
+    loop = asyncio.new_event_loop()
+    STATE.loop = loop
+
+    client = BleakClient(loop.run_until_complete(scan_for_device()))
+    loop.run_until_complete(client.connect())
+    syl.println(f"Connected to {client.address}")
     STATE.client = client
     return True
 
@@ -93,10 +108,21 @@ def start():
 
 
 def run():
+    loop = STATE.loop
+    assert loop is not None
+    t = time.time()
+    l = 0
     try:
         while not STATE.stop_requested and syl.is_running():
-            out.submit([int(time.time() * 1e6), asyncio.run(read_battery_level())])
-            syl.wait(20)
+            syl.println("Reading battery level...")
+            level = loop.run_until_complete(read_battery_level())
+            t1 = time.time()
+            block = syl.IntSignalBlock()
+            block.timestamps = np.array([int((t1 - t) * 1e6)], dtype=np.uint64)
+            block.data = np.array([[int((t1 - t) * 1e9), level + l]], dtype=np.int64)
+            l += 1
+            out.submit(block)
+            syl.wait_sec(1)
     finally:
         cleanup()
 
