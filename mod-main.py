@@ -15,7 +15,7 @@ UI_FILE_PATH = "settings.ui"
 PPG_SAMPLE_RATE_HZ = 176
 PPG_RESOLUTION_BITS = 22
 PPG_CHANNELS = 4
-PPG_BATCH_SIZE = 64
+PPG_BATCH_SIZE = 64  # each PPG frame contains ~35-50 samples
 NS_PER_SEC = 1_000_000_000
 POLAR_ERR_ALREADY_IN_STATE = 6
 
@@ -75,6 +75,7 @@ async def ensure_not_streaming(pmd: PolarMeasurementData, measurement: str):
 async def start_sdk_mode():
     pmd = STATE.pmd
     assert pmd is not None
+    await ensure_not_streaming(pmd, "PPG")
     await ensure_not_streaming(pmd, "SDK")
     err_code, err_msg, _ = await pmd.start_streaming("SDK")
     if err_code != 0:
@@ -84,7 +85,6 @@ async def start_sdk_mode():
 async def start_ppg_streaming():
     pmd = STATE.pmd
     assert pmd is not None
-    await ensure_not_streaming(pmd, "PPG")
     err_code, err_msg, _ = await pmd.start_streaming(
         "PPG",
         SAMPLE_RATE=PPG_SAMPLE_RATE_HZ,
@@ -131,16 +131,13 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
         first_offset_ns = (
             (n_samples - 1) * NS_PER_SEC + PPG_SAMPLE_RATE_HZ // 2
         ) // PPG_SAMPLE_RATE_HZ
-        STATE.t0_ns = int(frame_timestamp_ns) - first_offset_ns
-
-    t0_ns = STATE.t0_ns
-    assert t0_ns is not None
+        STATE.t0_ns = frame_timestamp_ns - first_offset_ns
 
     for back_idx, sample in zip(range(n_samples - 1, -1, -1), payload):
-        ts_ns = int(frame_timestamp_ns) - (
+        ts_ns = frame_timestamp_ns - (
             (back_idx * NS_PER_SEC + PPG_SAMPLE_RATE_HZ // 2) // PPG_SAMPLE_RATE_HZ
         )
-        timestamps_us.append((ts_ns - t0_ns) // 1_000)
+        timestamps_us.append((ts_ns - STATE.t0_ns) // 1_000)
         rows.append([int(sample[0]), int(sample[1]), int(sample[2]), int(sample[3])])
 
     if len(timestamps_us) >= PPG_BATCH_SIZE:
@@ -175,6 +172,7 @@ def cleanup():
 
     STATE.stop_requested = False
     STATE.t0_ns = None
+    syl.println("Cleanup complete")
 
 
 # ## ###############################################################################################
@@ -199,7 +197,12 @@ def prepare():
     STATE.ppg_queue = asyncio.Queue()
     STATE.pmd = PolarMeasurementData(client, ppg_queue=STATE.ppg_queue)
     STATE.t0_ns = None
-    loop.run_until_complete(start_sdk_mode())
+    try:
+        loop.run_until_complete(start_sdk_mode())
+    except Exception as exc:
+        syl.println(f"Start SDK mode failed: {exc.__class__.__name__}({exc})")
+        cleanup()
+        raise
     return True
 
 
