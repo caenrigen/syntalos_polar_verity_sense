@@ -20,6 +20,7 @@ PPG_BATCH_SIZE = 128  # decoded samples per Syntalos block
 PPG_QUEUE_TIMEOUT_SEC = 0.005
 PPG_MAX_FRAMES_PER_SLICE = 16
 NS_PER_SEC = 1_000_000_000
+POLAR_ERR_ALREADY_IN_STATE = 6
 
 
 @dataclass
@@ -80,9 +81,21 @@ async def start_ppg_streaming():
         except asyncio.QueueEmpty:
             break
 
+    # Reset PMD state first for reproducible behavior across restarts/reconnects.
+    for measurement in ("PPG", "SDK"):
+        err_code, err_msg = await pmd.stop_streaming(measurement)
+        if err_code not in (0, POLAR_ERR_ALREADY_IN_STATE):
+            raise RuntimeError(
+                f"Failed to stop {measurement} before restart: {err_code} {err_msg}"
+            )
+        if err_code == 0:
+            syl.println(f"Stopped existing {measurement} stream/state before start")
+
     err_code, err_msg, _ = await pmd.start_streaming("SDK")
-    if err_code != 0:
+    if err_code not in (0, POLAR_ERR_ALREADY_IN_STATE):
         raise RuntimeError(f"Failed to start SDK mode: {err_code} {err_msg}")
+    if err_code == POLAR_ERR_ALREADY_IN_STATE:
+        syl.println("Verity Sense SDK mode already active")
     STATE.sdk_mode_started = True
 
     err_code, err_msg, _ = await pmd.start_streaming(
@@ -91,8 +104,10 @@ async def start_ppg_streaming():
         RESOLUTION=PPG_RESOLUTION_BITS,
         CHANNELS=PPG_CHANNELS,
     )
-    if err_code != 0:
+    if err_code not in (0, POLAR_ERR_ALREADY_IN_STATE):
         raise RuntimeError(f"Failed to start PPG stream: {err_code} {err_msg}")
+    if err_code == POLAR_ERR_ALREADY_IN_STATE:
+        syl.println("Verity Sense PPG stream already active")
     STATE.ppg_stream_started = True
 
 
@@ -245,7 +260,7 @@ def run():
 
             # Mandatory for Syntalos Python modules: this lets Syntalos process IPC,
             # including stop() requests, while we are streaming in a tight Python loop.
-            syl.wait(1)
+            syl.wait(5)
     finally:
         submit_batch(timestamps_us, rows)
         cleanup()
