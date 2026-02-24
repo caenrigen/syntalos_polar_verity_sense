@@ -37,8 +37,6 @@ class State:
     client: BleakClient | None = None
     pmd: PolarMeasurementData | None = None
     ppg_queue: asyncio.Queue | None = None
-    ppg_stream_started: bool = False
-    sdk_mode_started: bool = False
     t0_ns: int | None = None
 
 
@@ -69,66 +67,50 @@ async def scan_for_device():
     return device
 
 
+async def ensure_not_streaming(pmd: PolarMeasurementData, measurement: str):
+    err_code, err_msg = await pmd.stop_streaming(measurement)
+    if err_code not in (0, POLAR_ERR_ALREADY_IN_STATE):
+        raise RuntimeError(
+            f"Failed to stop {measurement} before restart: {err_code} {err_msg}"
+        )
+    if err_code == 0:
+        syl.println(f"Stopped existing {measurement} stream/state before start")
+
+
+async def start_sdk_mode():
+    pmd = STATE.pmd
+    assert pmd is not None
+    await ensure_not_streaming(pmd, "SDK")
+    err_code, err_msg, _ = await pmd.start_streaming("SDK")
+    if err_code != 0:
+        raise RuntimeError(f"Failed to start SDK mode: {err_code} {err_msg}")
+
+
 async def start_ppg_streaming():
     pmd = STATE.pmd
-    queue = STATE.ppg_queue
     assert pmd is not None
-    assert queue is not None
-
-    while True:
-        try:
-            queue.get_nowait()
-        except asyncio.QueueEmpty:
-            break
-
-    # Reset PMD state first for reproducible behavior across restarts/reconnects.
-    for measurement in ("PPG", "SDK"):
-        err_code, err_msg = await pmd.stop_streaming(measurement)
-        if err_code not in (0, POLAR_ERR_ALREADY_IN_STATE):
-            raise RuntimeError(
-                f"Failed to stop {measurement} before restart: {err_code} {err_msg}"
-            )
-        if err_code == 0:
-            syl.println(f"Stopped existing {measurement} stream/state before start")
-
-    err_code, err_msg, _ = await pmd.start_streaming("SDK")
-    if err_code not in (0, POLAR_ERR_ALREADY_IN_STATE):
-        raise RuntimeError(f"Failed to start SDK mode: {err_code} {err_msg}")
-    if err_code == POLAR_ERR_ALREADY_IN_STATE:
-        syl.println("Verity Sense SDK mode already active")
-    STATE.sdk_mode_started = True
-
+    await ensure_not_streaming(pmd, "PPG")
     err_code, err_msg, _ = await pmd.start_streaming(
         "PPG",
         SAMPLE_RATE=PPG_SAMPLE_RATE_HZ,
         RESOLUTION=PPG_RESOLUTION_BITS,
         CHANNELS=PPG_CHANNELS,
     )
-    if err_code not in (0, POLAR_ERR_ALREADY_IN_STATE):
+    if err_code != 0:
         raise RuntimeError(f"Failed to start PPG stream: {err_code} {err_msg}")
-    if err_code == POLAR_ERR_ALREADY_IN_STATE:
-        syl.println("Verity Sense PPG stream already active")
-    STATE.ppg_stream_started = True
 
 
-async def stop_streaming_and_disconnect():
+async def stop_streaming():
     pmd = STATE.pmd
-    client = STATE.client
-
-    if pmd is not None and client is not None and client.is_connected:
-        if STATE.ppg_stream_started:
-            try:
-                await pmd.stop_streaming("PPG")
-            except Exception as exc:
-                syl.println(f"PPG stop failed: {exc}")
-        if STATE.sdk_mode_started:
-            try:
-                await pmd.stop_streaming("SDK")
-            except Exception as exc:
-                syl.println(f"SDK stop failed: {exc}")
-
-    if client is not None and client.is_connected:
-        await client.disconnect()
+    assert pmd is not None
+    try:
+        await pmd.stop_streaming("PPG")
+    except Exception as exc:
+        syl.println(f"PPG stop failed: {exc}")
+    try:
+        await pmd.stop_streaming("SDK")
+    except Exception as exc:
+        syl.println(f"SDK stop failed: {exc}")
 
 
 def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
@@ -170,23 +152,29 @@ def append_ppg_frame_to_batch(frame, timestamps_us: list[int], rows: list[list[i
 
 
 def cleanup():
-    client = STATE.client
     loop = STATE.loop
+    assert loop is not None
+    client = STATE.client
+    assert client is not None
 
-    if loop is not None and not loop.is_closed():
-        if client and client.is_connected:
-            loop.run_until_complete(stop_streaming_and_disconnect())
+    try:
+        loop.run_until_complete(stop_streaming())
+    except Exception as exc:
+        syl.println(f"Stop streaming failed: {exc}")
 
-    if loop is not None and not loop.is_closed():
-        loop.close()
+    try:
+        loop.run_until_complete(client.disconnect())
+    except Exception as exc:
+        syl.println(f"Disconnect failed: {exc}")
 
-    STATE.client = None
-    STATE.pmd = None
-    STATE.ppg_queue = None
+    loop.close()
+
     STATE.loop = None
+    STATE.client = None
+    STATE.ppg_queue = None
+    STATE.pmd = None
+
     STATE.stop_requested = False
-    STATE.ppg_stream_started = False
-    STATE.sdk_mode_started = False
     STATE.t0_ns = None
 
 
@@ -212,6 +200,7 @@ def prepare():
     STATE.ppg_queue = asyncio.Queue()
     STATE.pmd = PolarMeasurementData(client, ppg_queue=STATE.ppg_queue)
     STATE.t0_ns = None
+    loop.run_until_complete(start_sdk_mode())
     return True
 
 
