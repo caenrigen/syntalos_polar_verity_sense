@@ -1,7 +1,6 @@
 import syntalos_mlink as syl
 
 import asyncio
-
 from dataclasses import dataclass, asdict
 import json
 
@@ -16,9 +15,7 @@ UI_FILE_PATH = "settings.ui"
 PPG_SAMPLE_RATE_HZ = 176
 PPG_RESOLUTION_BITS = 22
 PPG_CHANNELS = 4
-PPG_BATCH_SIZE = 128  # decoded samples per Syntalos block
-PPG_QUEUE_TIMEOUT_SEC = 0.005
-PPG_MAX_FRAMES_PER_SLICE = 16
+PPG_BATCH_SIZE = 64
 NS_PER_SEC = 1_000_000_000
 POLAR_ERR_ALREADY_IN_STATE = 6
 
@@ -70,9 +67,7 @@ async def scan_for_device():
 async def ensure_not_streaming(pmd: PolarMeasurementData, measurement: str):
     err_code, err_msg = await pmd.stop_streaming(measurement)
     if err_code not in (0, POLAR_ERR_ALREADY_IN_STATE):
-        raise RuntimeError(
-            f"Failed to stop {measurement} before restart: {err_code} {err_msg}"
-        )
+        raise RuntimeError(f"Failed to stop {measurement} before restart: {err_code} {err_msg}")
     if err_code == 0:
         syl.println(f"Stopped existing {measurement} stream/state before start")
 
@@ -114,8 +109,6 @@ async def stop_streaming():
 
 
 def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
-    if not timestamps_us:
-        return
     block = syl.IntSignalBlock()
     block.timestamps = np.array(timestamps_us, dtype=np.uint64)
     block.data = np.array(rows, dtype=np.int64)
@@ -124,7 +117,7 @@ def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
     rows.clear()
 
 
-def append_ppg_frame_to_batch(frame, timestamps_us: list[int], rows: list[list[int]]):
+def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
     dtype, frame_timestamp_ns, payload = frame
     if dtype != "PPG":
         syl.println(f"Expected PPG frame, got {dtype}")
@@ -150,6 +143,9 @@ def append_ppg_frame_to_batch(frame, timestamps_us: list[int], rows: list[list[i
         timestamps_us.append((ts_ns - t0_ns) // 1_000)
         rows.append([int(sample[0]), int(sample[1]), int(sample[2]), int(sample[3])])
 
+    if len(timestamps_us) >= PPG_BATCH_SIZE:
+        submit_batch(timestamps_us, rows)
+
 
 def cleanup():
     loop = STATE.loop
@@ -160,12 +156,15 @@ def cleanup():
     try:
         loop.run_until_complete(stop_streaming())
     except Exception as exc:
-        syl.println(f"Stop streaming failed: {exc}")
+        syl.println(f"Stop streaming failed: {exc.__class__.__name__}({exc})")
 
     try:
         loop.run_until_complete(client.disconnect())
+    except EOFError:
+        # Happens sometimes but does not seem to be problematic
+        syl.println("EOFError at client.disconnect()")
     except Exception as exc:
-        syl.println(f"Disconnect failed: {exc}")
+        syl.println(f"Disconnect failed: {exc.__class__.__name__}({exc})")
 
     loop.close()
 
@@ -220,38 +219,16 @@ def run():
     rows: list[list[int]] = []
     try:
         while not STATE.stop_requested and syl.is_running():
-            try:
-                frame = loop.run_until_complete(
-                    asyncio.wait_for(ppg_queue.get(), timeout=PPG_QUEUE_TIMEOUT_SEC)
-                )
-            except asyncio.TimeoutError:
-                submit_batch(timestamps_us, rows)
-                syl.wait(5)
-                continue
-
-            append_ppg_frame_to_batch(frame, timestamps_us, rows)
-
-            drained_frames = 0
+            # Give the async loop a chance to advance
+            loop.run_until_complete(asyncio.sleep(0.020))
             while True:
                 try:
                     frame = ppg_queue.get_nowait()
+                    process_ppg_frame(frame, timestamps_us, rows)
                 except asyncio.QueueEmpty:
                     break
-                append_ppg_frame_to_batch(frame, timestamps_us, rows)
-                drained_frames += 1
-                if len(timestamps_us) >= PPG_BATCH_SIZE:
-                    submit_batch(timestamps_us, rows)
-                if drained_frames >= PPG_MAX_FRAMES_PER_SLICE:
-                    break
-
-            if len(timestamps_us) >= PPG_BATCH_SIZE:
-                submit_batch(timestamps_us, rows)
-
-            # Mandatory for Syntalos Python modules: this lets Syntalos process IPC,
-            # including stop() requests, while we are streaming in a tight Python loop.
-            syl.wait(5)
+            syl.wait(5)  # ms
     finally:
-        submit_batch(timestamps_us, rows)
         cleanup()
 
 
