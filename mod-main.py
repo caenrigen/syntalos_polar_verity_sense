@@ -12,17 +12,18 @@ from bleakheart import PolarMeasurementData
 # Path to the UI file (same directory as this script)
 UI_FILE_PATH = "settings.ui"
 
-PPG_SAMPLE_RATE_HZ = 176
-PPG_RESOLUTION_BITS = 22
-PPG_CHANNELS = 4
-PPG_BATCH_SIZE = 64  # each PPG frame contains ~35-50 samples
 NS_PER_SEC = 1_000_000_000
 POLAR_ERR_ALREADY_IN_STATE = 6
 
 
 @dataclass
 class Settings:
-    tbd: str = "tbd"
+    # NB the device sends ~35-50 samples per frame, 64 is a reasonable batch size
+    batch_size: int = 64
+    sampling_rate: int = 176  # possible values: 28, 44, 55, 135, 176
+    # These are the only valid settings for PPG on Verity Sense
+    resolution: int = 22
+    channels: int = 4
 
 
 @dataclass
@@ -87,9 +88,9 @@ async def start_ppg_streaming():
     assert pmd is not None
     err_code, err_msg, _ = await pmd.start_streaming(
         "PPG",
-        SAMPLE_RATE=PPG_SAMPLE_RATE_HZ,
-        RESOLUTION=PPG_RESOLUTION_BITS,
-        CHANNELS=PPG_CHANNELS,
+        SAMPLE_RATE=STATE.settings.sampling_rate,
+        RESOLUTION=STATE.settings.resolution,
+        CHANNELS=STATE.settings.channels,
     )
     if err_code != 0:
         raise RuntimeError(f"Failed to start PPG stream: {err_code} {err_msg}")
@@ -129,18 +130,19 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
     n_samples = len(payload)
     if STATE.t0_ns is None:
         first_offset_ns = (
-            (n_samples - 1) * NS_PER_SEC + PPG_SAMPLE_RATE_HZ // 2
-        ) // PPG_SAMPLE_RATE_HZ
+            (n_samples - 1) * NS_PER_SEC + STATE.settings.sampling_rate // 2
+        ) // STATE.settings.sampling_rate
         STATE.t0_ns = frame_timestamp_ns - first_offset_ns
 
     for back_idx, sample in zip(range(n_samples - 1, -1, -1), payload):
         ts_ns = frame_timestamp_ns - (
-            (back_idx * NS_PER_SEC + PPG_SAMPLE_RATE_HZ // 2) // PPG_SAMPLE_RATE_HZ
+            (back_idx * NS_PER_SEC + STATE.settings.sampling_rate // 2)
+            // STATE.settings.sampling_rate
         )
         timestamps_us.append((ts_ns - STATE.t0_ns) // 1_000)
         rows.append([int(sample[0]), int(sample[1]), int(sample[2]), int(sample[3])])
 
-    if len(timestamps_us) >= PPG_BATCH_SIZE:
+    if len(timestamps_us) >= STATE.settings.batch_size:
         submit_batch(timestamps_us, rows)
 
 
@@ -158,7 +160,8 @@ def cleanup():
     try:
         loop.run_until_complete(client.disconnect())
     except EOFError:
-        # Happens sometimes but does not seem to be problematic
+        # Happens sometimes but does not seem to be problematic.
+        # So far I have seen it only inside a VM.
         syl.println("EOFError at client.disconnect()")
     except Exception as exc:
         syl.println(f"Disconnect failed: {exc.__class__.__name__}({exc})")
