@@ -8,16 +8,20 @@ import numpy as np
 from bleak import BleakScanner, BleakClient
 from bleak.backends.device import BLEDevice
 from bleakheart import PolarMeasurementData
+from PyQt6 import uic
+from PyQt6.QtWidgets import QDialog
 
 # Path to the UI file (same directory as this script)
 UI_FILE_PATH = "settings.ui"
 
 NS_PER_SEC = 1_000_000_000
 POLAR_ERR_ALREADY_IN_STATE = 6
+VALID_PPG_SAMPLE_RATES = [28, 44, 55, 135, 176]
 
 
 @dataclass
 class Settings:
+    device_address: str = ""
     # NB the device sends ~35-50 samples per frame, 64 is a reasonable batch size
     batch_size: int = 64
     sampling_rate: int = 176  # possible values: 28, 44, 55, 135, 176
@@ -56,8 +60,18 @@ def set_settings(settings: bytes):
         STATE.settings = Settings()
 
 
-async def scan_for_device():
-    device: BLEDevice | None = await BleakScanner.find_device_by_filter(
+async def scan_for_device(device_address: str):
+    device_address = device_address.strip()
+    if device_address:
+        addr = device_address.lower()
+        device: BLEDevice | None = await BleakScanner.find_device_by_filter(
+            lambda dev, adv: bool(dev.address and dev.address.lower() == addr)
+        )
+        if device is None:
+            raise RuntimeError(f"Polar device not found at address: {device_address}")
+        return device
+
+    device = await BleakScanner.find_device_by_filter(
         lambda dev, adv: bool(dev.name and "polar" in dev.name.lower())
     )
     if device is None:
@@ -193,9 +207,10 @@ def prepare():
     loop = asyncio.new_event_loop()
     STATE.loop = loop
 
-    client = BleakClient(loop.run_until_complete(scan_for_device()))
+    client = BleakClient(loop.run_until_complete(scan_for_device(STATE.settings.device_address)))
     loop.run_until_complete(client.connect())
     syl.println(f"Connected to {client.address}")
+    STATE.settings.device_address = client.address
     STATE.client = client
     STATE.ppg_queue = asyncio.Queue()
     STATE.pmd = PolarMeasurementData(client, ppg_queue=STATE.ppg_queue)
@@ -240,3 +255,38 @@ def run():
 
 def stop():
     STATE.stop_requested = True
+
+
+def show_settings(settings: bytes):
+    if not settings:
+        if STATE.settings is None:
+            STATE.settings = Settings()
+    else:
+        STATE.settings = deserialise_settings(settings)
+
+    dialog: QDialog = uic.loadUi(UI_FILE_PATH)
+
+    dialog.deviceAddressLineEdit.setText(STATE.settings.device_address)
+    dialog.batchSizeSpinBox.setValue(STATE.settings.batch_size)
+
+    dialog.samplingRateComboBox.clear()
+    for rate in VALID_PPG_SAMPLE_RATES:
+        dialog.samplingRateComboBox.addItem(f"{rate} Hz", rate)
+    current_index = dialog.samplingRateComboBox.findData(STATE.settings.sampling_rate)
+    if current_index < 0:
+        dialog.samplingRateComboBox.addItem(
+            f"{STATE.settings.sampling_rate} Hz", STATE.settings.sampling_rate
+        )
+        current_index = dialog.samplingRateComboBox.findData(STATE.settings.sampling_rate)
+    dialog.samplingRateComboBox.setCurrentIndex(current_index)
+
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        STATE.settings.device_address = dialog.deviceAddressLineEdit.text().strip()
+        sampling_rate = dialog.samplingRateComboBox.currentData()
+        if sampling_rate is not None:
+            STATE.settings.sampling_rate = int(sampling_rate)
+        STATE.settings.batch_size = dialog.batchSizeSpinBox.value()
+        syl.save_settings(serialise_settings(STATE.settings))
+
+
+syl.call_on_show_settings(show_settings)
