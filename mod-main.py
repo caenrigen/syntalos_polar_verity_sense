@@ -247,14 +247,14 @@ def run():
     try:
         while not STATE.stop_requested and syl.is_running():
             # Give the async loop a chance to advance
-            loop.run_until_complete(asyncio.sleep(0.020))
+            loop.run_until_complete(asyncio.sleep(0.040))
             while True:
                 try:
                     frame = ppg_queue.get_nowait()
                     process_ppg_frame(frame, timestamps_us, rows)
                 except asyncio.QueueEmpty:
                     break
-            syl.wait(5)  # ms
+            syl.wait(20)  # ms
     finally:
         cleanup()
 
