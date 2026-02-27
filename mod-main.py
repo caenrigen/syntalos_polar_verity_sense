@@ -9,6 +9,7 @@ from bleak import BleakScanner, BleakClient
 from bleak.backends.device import BLEDevice
 from bleakheart import PolarMeasurementData
 from PyQt6 import uic
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QDialog
 
 # Path to the UI file (same directory as this script)
@@ -17,11 +18,13 @@ UI_FILE_PATH = "settings.ui"
 NS_PER_SEC = 1_000_000_000
 POLAR_ERR_ALREADY_IN_STATE = 6
 VALID_PPG_SAMPLE_RATES = [28, 44, 55, 135, 176]
+DEVICE_NAME_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
 
 @dataclass
 class Settings:
     device_address: str = ""
+    device_name: str = ""
     # NB the device sends ~35-50 samples per frame, 64 is a reasonable batch size
     batch_size: int = 64
     sampling_rate: int = 176  # possible values: 28, 44, 55, 135, 176
@@ -71,12 +74,15 @@ async def scan_for_device(device_address: str):
             raise RuntimeError(f"Polar device not found at address: {device_address}")
         return device
 
-    device = await BleakScanner.find_device_by_filter(
-        lambda dev, adv: bool(dev.name and "polar" in dev.name.lower())
-    )
-    if device is None:
+    devices = await scan_for_polar_devices()
+    if not devices:
         raise RuntimeError("Polar device not found")
-    return device
+    return devices[0]
+
+
+async def scan_for_polar_devices() -> list[BLEDevice]:
+    devices = await BleakScanner.discover()
+    return [dev for dev in devices if dev.name and "polar " in dev.name.lower()]
 
 
 async def ensure_not_streaming(pmd: PolarMeasurementData, measurement: str):
@@ -257,6 +263,33 @@ def stop():
     STATE.stop_requested = True
 
 
+# ## ###############################################################################################
+# ## Settings UI
+# ## ###############################################################################################
+
+
+class DeviceScanWorker(QObject):
+    scan_done = pyqtSignal(object, str)  # list[tuple[name, address]], error_text
+    finished = pyqtSignal()
+
+    @pyqtSlot()
+    def run(self):
+        entries: list[tuple[str, str]] = []
+        error_text = ""
+        try:
+            devices = asyncio.run(scan_for_polar_devices())
+            for dev in devices:
+                if not dev.address:
+                    continue
+                name = (dev.name or "").strip() or "Polar device"
+                entries.append((name, dev.address))
+        except Exception as exc:
+            error_text = "Scan failed, check logs"
+            syl.println(f"Polar scan failed: {exc.__class__.__name__}({exc})")
+        self.scan_done.emit(entries, error_text)
+        self.finished.emit()
+
+
 def show_settings(settings: bytes):
     if not settings:
         if STATE.settings is None:
@@ -266,7 +299,7 @@ def show_settings(settings: bytes):
 
     dialog: QDialog = uic.loadUi(UI_FILE_PATH)
 
-    dialog.deviceAddressLineEdit.setText(STATE.settings.device_address)
+    dialog.deviceComboBox.setPlaceholderText("No Polar devices found")
     dialog.batchSizeSpinBox.setValue(STATE.settings.batch_size)
 
     dialog.samplingRateComboBox.clear()
@@ -280,8 +313,101 @@ def show_settings(settings: bytes):
         current_index = dialog.samplingRateComboBox.findData(STATE.settings.sampling_rate)
     dialog.samplingRateComboBox.setCurrentIndex(current_index)
 
+    scan_state = {
+        "thread": None,
+        "worker": None,
+        "selected_address": STATE.settings.device_address,
+    }
+
+    def set_scanning_ui(scanning: bool):
+        try:
+            dialog.deviceComboBox.setEnabled(not scanning)
+            dialog.refreshDevicesButton.setEnabled(not scanning)
+            if scanning:
+                dialog.deviceComboBox.clear()
+                dialog.deviceComboBox.setPlaceholderText("")
+                dialog.refreshDevicesButton.setToolTip("Scanning devices...")
+            else:
+                dialog.refreshDevicesButton.setToolTip("Refresh device list.")
+        except RuntimeError:
+            return
+
+    def finish_scan(entries: list[tuple[str, str]], error_text: str):
+        try:
+            dialog.deviceComboBox.clear()
+            if error_text:
+                dialog.deviceComboBox.setPlaceholderText(error_text)
+                return
+            if not entries:
+                dialog.deviceComboBox.setPlaceholderText("No Polar devices found")
+                return
+
+            for name, address in entries:
+                dialog.deviceComboBox.addItem(f"{name} ({address})", address)
+                idx = dialog.deviceComboBox.count() - 1
+                dialog.deviceComboBox.setItemData(idx, name, DEVICE_NAME_ROLE)
+
+            selected_index = -1
+            selected_address = scan_state["selected_address"]
+            if isinstance(selected_address, str) and selected_address:
+                selected_index = dialog.deviceComboBox.findData(selected_address)
+            if selected_index < 0 and STATE.settings.device_address:
+                selected_index = dialog.deviceComboBox.findData(STATE.settings.device_address)
+            if selected_index < 0:
+                selected_index = 0
+            dialog.deviceComboBox.setCurrentIndex(selected_index)
+        except RuntimeError:
+            return
+
+    def cleanup_scan_thread():
+        scan_state["thread"] = None
+        scan_state["worker"] = None
+        set_scanning_ui(False)
+
+    def start_scan():
+        thread = scan_state["thread"]
+        if isinstance(thread, QThread) and thread.isRunning():
+            return
+
+        current_address = dialog.deviceComboBox.currentData()
+        if isinstance(current_address, str) and current_address:
+            scan_state["selected_address"] = current_address
+        else:
+            scan_state["selected_address"] = STATE.settings.device_address
+
+        set_scanning_ui(True)
+        worker = DeviceScanWorker()
+        thread = QThread()
+        worker.moveToThread(thread)
+
+        worker.scan_done.connect(finish_scan)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(cleanup_scan_thread)
+        thread.started.connect(worker.run)
+
+        scan_state["thread"] = thread
+        scan_state["worker"] = worker
+        thread.start()
+
+    dialog.refreshDevicesButton.clicked.connect(start_scan)
+    if STATE.settings.device_address.strip():
+        saved_name = STATE.settings.device_name.strip() or "Saved Polar device"
+        saved_address = STATE.settings.device_address.strip()
+        dialog.deviceComboBox.clear()
+        dialog.deviceComboBox.addItem(f"{saved_name} ({saved_address}) [saved]", saved_address)
+        dialog.deviceComboBox.setItemData(0, saved_name, DEVICE_NAME_ROLE)
+        dialog.deviceComboBox.setCurrentIndex(0)
+    else:
+        start_scan()
+
     if dialog.exec() == QDialog.DialogCode.Accepted:
-        STATE.settings.device_address = dialog.deviceAddressLineEdit.text().strip()
+        address = dialog.deviceComboBox.currentData()
+        name = dialog.deviceComboBox.currentData(DEVICE_NAME_ROLE)
+        if isinstance(address, str) and address.strip():
+            STATE.settings.device_address = address.strip()
+            STATE.settings.device_name = name.strip() if isinstance(name, str) else ""
         sampling_rate = dialog.samplingRateComboBox.currentData()
         if sampling_rate is not None:
             STATE.settings.sampling_rate = int(sampling_rate)
