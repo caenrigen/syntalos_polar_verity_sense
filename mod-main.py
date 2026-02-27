@@ -213,10 +213,9 @@ def prepare():
     loop = asyncio.new_event_loop()
     STATE.loop = loop
 
-    client = BleakClient(loop.run_until_complete(scan_for_device(STATE.settings.device_address)))
+    client = BleakClient(STATE.settings.device_address)
     loop.run_until_complete(client.connect())
-    syl.println(f"Connected to {client.address}")
-    STATE.settings.device_address = client.address
+    # syl.println(f"Connected to {client.address}")
     STATE.client = client
     STATE.ppg_queue = asyncio.Queue()
     STATE.pmd = PolarMeasurementData(client, ppg_queue=STATE.ppg_queue)
