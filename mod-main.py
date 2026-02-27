@@ -18,7 +18,6 @@ UI_FILE_PATH = "settings.ui"
 NS_PER_SEC = 1_000_000_000
 POLAR_ERR_ALREADY_IN_STATE = 6
 VALID_PPG_SAMPLE_RATES = [28, 44, 55, 135, 176]
-DEVICE_NAME_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
 
 @dataclass
@@ -108,9 +107,9 @@ async def start_ppg_streaming():
     assert pmd is not None
     err_code, err_msg, _ = await pmd.start_streaming(
         "PPG",
-        SAMPLE_RATE=STATE.settings.sampling_rate,
-        RESOLUTION=STATE.settings.resolution,
-        CHANNELS=STATE.settings.channels,
+        sample_rate=STATE.settings.sampling_rate,
+        resolution=STATE.settings.resolution,
+        channels=STATE.settings.channels,
     )
     if err_code != 0:
         raise RuntimeError(f"Failed to start PPG stream: {err_code} {err_msg}")
@@ -195,6 +194,7 @@ def cleanup():
 
     STATE.stop_requested = False
     STATE.t0_ns = None
+    # TODO: figure out how to make cleanup finish at the end of stop()
     syl.println("Cleanup complete")
 
 
@@ -266,6 +266,9 @@ def stop():
 # ## ###############################################################################################
 # ## Settings UI
 # ## ###############################################################################################
+
+
+DEVICE_NAME_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
 
 class DeviceScanWorker(QObject):
