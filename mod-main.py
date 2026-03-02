@@ -44,7 +44,17 @@ class State:
     t0_ns: int | None = None
 
 
-STATE = State()
+def clear_state():
+    # Settings should stay persistent across runs
+    STATE.stop_requested = False
+    STATE.loop = None
+    STATE.client = None
+    STATE.ppg_queue = None
+    STATE.pmd = None
+    STATE.t0_ns = None
+
+
+STATE: State = State()
 
 
 def serialise_settings(settings: Settings) -> bytes:
@@ -53,13 +63,6 @@ def serialise_settings(settings: Settings) -> bytes:
 
 def deserialise_settings(settings: bytes) -> Settings:
     return Settings(**json.loads(settings.decode()))  # pyright: ignore[reportAny]
-
-
-def set_settings(settings: bytes):
-    if settings:
-        STATE.settings = deserialise_settings(settings)
-    elif STATE.settings is None:
-        STATE.settings = Settings()
 
 
 async def scan_for_device(device_address: str):
@@ -187,13 +190,6 @@ def cleanup():
 
     loop.close()
 
-    STATE.loop = None
-    STATE.client = None
-    STATE.ppg_queue = None
-    STATE.pmd = None
-
-    STATE.stop_requested = False
-    STATE.t0_ns = None
     # TODO: figure out how to make cleanup finish at the end of stop()
     syl.println("Cleanup complete")
 
@@ -210,6 +206,9 @@ out.set_metadata_value("data_unit", ["raw", "raw", "raw", "raw"])
 
 
 def prepare():
+    clear_state()
+    assert STATE.settings is not None
+
     loop = asyncio.new_event_loop()
     STATE.loop = loop
 
@@ -219,7 +218,7 @@ def prepare():
     STATE.client = client
     STATE.ppg_queue = asyncio.Queue()
     STATE.pmd = PolarMeasurementData(client, ppg_queue=STATE.ppg_queue)
-    STATE.t0_ns = None
+
     try:
         loop.run_until_complete(start_sdk_mode())
     except Exception as exc:
@@ -246,20 +245,27 @@ def run():
     try:
         while not STATE.stop_requested and syl.is_running():
             # Give the async loop a chance to advance
-            loop.run_until_complete(asyncio.sleep(0.040))
+            loop.run_until_complete(asyncio.sleep(0.010))
             while True:
                 try:
                     frame = ppg_queue.get_nowait()
                     process_ppg_frame(frame, timestamps_us, rows)
                 except asyncio.QueueEmpty:
                     break
-            syl.wait(20)  # ms
+            syl.wait(1)  # ms
     finally:
         cleanup()
 
 
 def stop():
     STATE.stop_requested = True
+
+
+def set_settings(settings: bytes):
+    if settings:
+        STATE.settings = deserialise_settings(settings)
+    elif STATE.settings is None:
+        STATE.settings = Settings()
 
 
 # ## ###############################################################################################
