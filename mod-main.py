@@ -124,11 +124,11 @@ async def stop_streaming():
     try:
         await pmd.stop_streaming("PPG")
     except Exception as exc:
-        syl.println(f"PPG stop failed: {exc}")
+        syl.println(f"PPG stop failed: {exc.__class__.__name__}({exc})")
     try:
         await pmd.stop_streaming("SDK")
     except Exception as exc:
-        syl.println(f"SDK stop failed: {exc}")
+        syl.println(f"SDK stop failed: {exc.__class__.__name__}({exc})")
 
 
 def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
@@ -195,7 +195,7 @@ def cleanup():
 
 
 # # ################################################################################################
-# Syntalos interface
+# # Syntalos interface
 # # ################################################################################################
 
 
@@ -211,23 +211,23 @@ def prepare():
     if not STATE.settings.device_address:
         raise ValueError("Device address not set, edit the settings and try again")
 
-    loop = asyncio.new_event_loop()
-    STATE.loop = loop
-
-    client = BleakClient(STATE.settings.device_address)
-    loop.run_until_complete(client.connect())
-    # syl.println(f"Connected to {client.address}")
-    STATE.client = client
-    STATE.ppg_queue = asyncio.Queue()
-    STATE.pmd = PolarMeasurementData(client, ppg_queue=STATE.ppg_queue)
-
     try:
+        loop = asyncio.new_event_loop()
+        STATE.loop = loop
+
+        client = BleakClient(STATE.settings.device_address)
+        loop.run_until_complete(client.connect())
+        STATE.client = client
+        STATE.ppg_queue = asyncio.Queue()
+        STATE.pmd = PolarMeasurementData(client, ppg_queue=STATE.ppg_queue)
+
         loop.run_until_complete(start_sdk_mode())
+        return True
     except Exception as exc:
-        syl.println(f"Start SDK mode failed: {exc.__class__.__name__}({exc})")
+        msg = f"Prepare failed: {exc.__class__.__name__}({exc})"
+        syl.println(msg)
         cleanup()
-        raise
-    return True
+        syl.raise_error(msg)
 
 
 def start():
@@ -255,6 +255,11 @@ def run():
                 except asyncio.QueueEmpty:
                     break
             syl.wait(1)  # ms
+    except Exception as exc:
+        msg = f"Run failed: {exc.__class__.__name__}({exc})"
+        syl.println(msg)
+        cleanup()
+        syl.raise_error(msg)
     finally:
         cleanup()
 
@@ -265,7 +270,13 @@ def stop():
 
 def set_settings(settings: bytes):
     if settings:
-        STATE.settings = deserialise_settings(settings)
+        try:
+            STATE.settings = deserialise_settings(settings)
+        except Exception as exc:
+            msg = f"Failed to parse settings: {exc.__class__.__name__}({exc})"
+            syl.println(msg)
+            syl.raise_error(msg)
+            STATE.settings = Settings()
     elif STATE.settings is None:
         STATE.settings = Settings()
 
