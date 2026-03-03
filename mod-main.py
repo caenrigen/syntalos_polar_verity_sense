@@ -208,6 +208,8 @@ out.set_metadata_value("data_unit", ["raw", "raw", "raw", "raw"])
 def prepare():
     clear_state()
     assert STATE.settings is not None
+    if not STATE.settings.device_address:
+        raise ValueError("Device address not set, edit the settings and try again")
 
     loop = asyncio.new_event_loop()
     STATE.loop = loop
