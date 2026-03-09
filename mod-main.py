@@ -36,6 +36,7 @@ class Settings:
 class State:
     settings: Settings | None = None
     stop_requested: bool = False
+    running: bool = False
 
     loop: asyncio.AbstractEventLoop | None = None
     client: BleakClient | None = None
@@ -47,6 +48,7 @@ class State:
 def clear_state():
     # Settings should stay persistent across runs
     STATE.stop_requested = False
+    STATE.running = False
     STATE.loop = None
     STATE.client = None
     STATE.ppg_queue = None
@@ -237,6 +239,7 @@ def start():
 
 
 def run():
+    STATE.running = True
     loop = STATE.loop
     ppg_queue = STATE.ppg_queue
     assert loop is not None
@@ -258,7 +261,6 @@ def run():
     except Exception as exc:
         msg = f"Run failed: {exc.__class__.__name__}({exc})"
         syl.println(msg)
-        cleanup()
         syl.raise_error(msg)
     finally:
         cleanup()
@@ -266,6 +268,9 @@ def run():
 
 def stop():
     STATE.stop_requested = True
+    # In case other modules trigger a premature stop(), we need to call cleanup() here
+    if not STATE.running:
+        cleanup()
 
 
 def set_settings(settings: bytes):
@@ -312,6 +317,12 @@ class DeviceScanWorker(QObject):
 
 
 def show_settings(settings: bytes):
+    # Showing the settings UI while running prevents the run() loop from advancing.
+    # Keep it simple: no settings UI while running.
+    if STATE.running:
+        syl.println("Cannot show settings while running")
+        return
+
     if not settings:
         if STATE.settings is None:
             STATE.settings = Settings()
