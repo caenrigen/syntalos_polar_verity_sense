@@ -172,14 +172,19 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
 
 def cleanup():
     loop = STATE.loop
-    assert loop is not None
-    client = STATE.client
-    assert client is not None
+    if loop is None:
+        syl.println("No event loop to cleanup, skipping cleanup()")
+        return
 
     try:
         loop.run_until_complete(stop_streaming())
     except Exception as exc:
         syl.println(f"Stop streaming failed: {exc.__class__.__name__}({exc})")
+
+    client = STATE.client
+    if client is None:
+        syl.println("No client to disconnect, skipping client.disconnect()")
+        return
 
     try:
         loop.run_until_complete(client.disconnect())
@@ -209,7 +214,10 @@ out.set_metadata_value("data_unit", ["raw", "raw", "raw", "raw"])
 
 def prepare():
     clear_state()
-    assert STATE.settings is not None
+    if STATE.settings is None:
+        syl.println("Settings not set, aborting prepare()")
+        return False
+
     if not STATE.settings.device_address:
         raise ValueError("Device address not set, edit the settings and try again")
 
