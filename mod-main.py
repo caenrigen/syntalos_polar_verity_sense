@@ -10,7 +10,7 @@ from bleak.backends.device import BLEDevice
 from bleakheart import PolarMeasurementData
 from PyQt6 import uic
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtWidgets import QDialog
+from PyQt6.QtWidgets import QDialog, QLayout
 
 # Path to the UI file (same directory as this script)
 UI_FILE_PATH = "settings.ui"
@@ -37,6 +37,7 @@ class State:
     settings: Settings | None = None
     stop_requested: bool = False
     running: bool = False
+    settings_dialog: QDialog | None = None
 
     loop: asyncio.AbstractEventLoop | None = None
     client: BleakClient | None = None
@@ -65,6 +66,24 @@ def serialise_settings(settings: Settings) -> bytes:
 
 def deserialise_settings(settings: bytes) -> Settings:
     return Settings(**json.loads(settings.decode()))  # pyright: ignore[reportAny]
+
+
+def save_current_settings() -> None:
+    assert STATE.settings is not None
+    syl.save_settings(serialise_settings(STATE.settings))
+
+
+def close_settings_dialog() -> None:
+    dialog = STATE.settings_dialog
+    if dialog is not None:
+        dialog.close()
+
+
+def fit_dialog_to_contents(dialog: QDialog) -> None:
+    layout = dialog.layout()
+    if layout is not None:
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+    dialog.adjustSize()
 
 
 async def scan_for_device(device_address: str):
@@ -214,6 +233,7 @@ out.set_metadata_value("data_unit", ["raw", "raw", "raw", "raw"])
 
 def prepare():
     clear_state()
+    close_settings_dialog()
     if STATE.settings is None:
         syl.println("Settings not set, aborting prepare()")
         return False
@@ -337,7 +357,16 @@ def show_settings(settings: bytes):
     else:
         STATE.settings = deserialise_settings(settings)
 
-    dialog: QDialog = uic.loadUi(UI_FILE_PATH)
+    dialog = STATE.settings_dialog
+    if dialog is not None:
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        return
+
+    dialog = uic.loadUi(UI_FILE_PATH)
+    STATE.settings_dialog = dialog
+    fit_dialog_to_contents(dialog)
 
     dialog.deviceComboBox.setPlaceholderText("No Polar devices found")
     dialog.batchSizeSpinBox.setValue(STATE.settings.batch_size)
@@ -404,6 +433,22 @@ def show_settings(settings: bytes):
         scan_state["worker"] = None
         set_scanning_ui(False)
 
+    def persist_settings():
+        assert STATE.settings is not None
+        address = dialog.deviceComboBox.currentData()
+        name = dialog.deviceComboBox.currentData(DEVICE_NAME_ROLE)
+        if isinstance(address, str) and address.strip():
+            STATE.settings.device_address = address.strip()
+            STATE.settings.device_name = name.strip() if isinstance(name, str) else ""
+        sampling_rate = dialog.samplingRateComboBox.currentData()
+        if sampling_rate is not None:
+            STATE.settings.sampling_rate = int(sampling_rate)
+        STATE.settings.batch_size = dialog.batchSizeSpinBox.value()
+        save_current_settings()
+
+    def cleanup_dialog():
+        STATE.settings_dialog = None
+
     def start_scan():
         thread = scan_state["thread"]
         if isinstance(thread, QThread) and thread.isRunning():
@@ -432,6 +477,10 @@ def show_settings(settings: bytes):
         thread.start()
 
     dialog.refreshDevicesButton.clicked.connect(start_scan)
+    dialog.deviceComboBox.currentIndexChanged.connect(persist_settings)
+    dialog.samplingRateComboBox.currentIndexChanged.connect(persist_settings)
+    dialog.batchSizeSpinBox.valueChanged.connect(persist_settings)
+    dialog.finished.connect(cleanup_dialog)
     if STATE.settings.device_address.strip():
         saved_name = STATE.settings.device_name.strip() or "Saved Polar device"
         saved_address = STATE.settings.device_address.strip()
@@ -442,17 +491,9 @@ def show_settings(settings: bytes):
     else:
         start_scan()
 
-    if dialog.exec() == QDialog.DialogCode.Accepted:
-        address = dialog.deviceComboBox.currentData()
-        name = dialog.deviceComboBox.currentData(DEVICE_NAME_ROLE)
-        if isinstance(address, str) and address.strip():
-            STATE.settings.device_address = address.strip()
-            STATE.settings.device_name = name.strip() if isinstance(name, str) else ""
-        sampling_rate = dialog.samplingRateComboBox.currentData()
-        if sampling_rate is not None:
-            STATE.settings.sampling_rate = int(sampling_rate)
-        STATE.settings.batch_size = dialog.batchSizeSpinBox.value()
-        syl.save_settings(serialise_settings(STATE.settings))
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
 
 
 syl.call_on_show_settings(show_settings)
