@@ -328,7 +328,7 @@ class DeviceScanWorker(QObject):
 def show_settings(settings: bytes):
     # Showing the settings UI while running prevents the run() loop from advancing.
     # Keep it simple: no settings UI while running.
-    if STATE.running:
+    if STATE.running or syl.is_running():
         syl.println("Cannot show settings while running")
         return
 
@@ -371,7 +371,7 @@ def show_settings(settings: bytes):
             else:
                 dialog.refreshDevicesButton.setToolTip("Refresh device list.")
         except RuntimeError:
-            return
+            syl.println("RuntimeError in set_scanning_ui()")
 
     def finish_scan(entries: list[tuple[str, str]], error_text: str):
         try:
@@ -398,7 +398,7 @@ def show_settings(settings: bytes):
                 selected_index = 0
             dialog.deviceComboBox.setCurrentIndex(selected_index)
         except RuntimeError:
-            return
+            syl.println("RuntimeError in finish_scan()")
 
     def cleanup_scan_thread():
         scan_state["thread"] = None
