@@ -38,6 +38,9 @@ class State:
     stop_requested: bool = False
     running: bool = False
     settings_dialog: QDialog | None = None
+    scan_thread: QThread | None = None
+    scan_worker: QObject | None = None
+    scan_selected_address: str = ""
 
     loop: asyncio.AbstractEventLoop | None = None
     client: BleakClient | None = None
@@ -345,6 +348,121 @@ class DeviceScanWorker(QObject):
         self.finished.emit()
 
 
+def set_scanning_ui(scanning: bool) -> None:
+    dialog = STATE.settings_dialog
+    if dialog is None:
+        return
+
+    dialog.deviceComboBox.setEnabled(not scanning)
+    dialog.refreshDevicesButton.setEnabled(not scanning)
+    if scanning:
+        dialog.deviceComboBox.clear()
+        dialog.deviceComboBox.setPlaceholderText("Scanning...")
+        dialog.refreshDevicesButton.setToolTip("Scanning for Polar devices...")
+    else:
+        dialog.refreshDevicesButton.setToolTip("Scan again")
+
+
+def persist_settings() -> None:
+    dialog = STATE.settings_dialog
+    if dialog is None:
+        return
+
+    assert STATE.settings is not None
+
+    address = dialog.deviceComboBox.currentData()
+    name = dialog.deviceComboBox.currentData(DEVICE_NAME_ROLE)
+    if isinstance(address, str) and address.strip():
+        STATE.scan_selected_address = address.strip()
+        STATE.settings.device_address = address.strip()
+        STATE.settings.device_name = name.strip() if isinstance(name, str) else ""
+
+    sampling_rate = dialog.samplingRateComboBox.currentData()
+    if sampling_rate is not None:
+        STATE.settings.sampling_rate = int(sampling_rate)
+    STATE.settings.batch_size = dialog.batchSizeSpinBox.value()
+    save_current_settings()
+
+
+def cleanup_settings_dialog(_result: int) -> None:
+    dialog = STATE.settings_dialog
+    if dialog is None:
+        return
+
+    persist_settings()
+    STATE.settings_dialog = None
+    dialog.deleteLater()
+
+
+def cleanup_scan_thread() -> None:
+    STATE.scan_thread = None
+    STATE.scan_worker = None
+    set_scanning_ui(False)
+
+
+def start_scan() -> None:
+    dialog = STATE.settings_dialog
+    if dialog is None:
+        return
+
+    thread = STATE.scan_thread
+    if isinstance(thread, QThread) and thread.isRunning():
+        set_scanning_ui(True)
+        return
+
+    current_address = dialog.deviceComboBox.currentData()
+    if isinstance(current_address, str) and current_address.strip():
+        STATE.scan_selected_address = current_address.strip()
+    elif STATE.settings is not None:
+        STATE.scan_selected_address = STATE.settings.device_address
+    else:
+        STATE.scan_selected_address = ""
+
+    set_scanning_ui(True)
+    worker = DeviceScanWorker()
+    thread = QThread()
+    worker.moveToThread(thread)
+
+    worker.scan_done.connect(finish_scan)
+    worker.finished.connect(thread.quit)
+    worker.finished.connect(worker.deleteLater)
+    thread.finished.connect(thread.deleteLater)
+    thread.finished.connect(cleanup_scan_thread)
+    thread.started.connect(worker.run)
+
+    STATE.scan_thread = thread
+    STATE.scan_worker = worker
+    thread.start()
+
+
+def finish_scan(entries: list[tuple[str, str]], error_text: str) -> None:
+    dialog = STATE.settings_dialog
+    if dialog is None:
+        return
+
+    dialog.deviceComboBox.clear()
+    if error_text:
+        dialog.deviceComboBox.setPlaceholderText(error_text)
+        return
+    if not entries:
+        dialog.deviceComboBox.setPlaceholderText("No Polar devices found")
+        return
+
+    for name, address in entries:
+        dialog.deviceComboBox.addItem(f"{name} ({address})", address)
+        idx = dialog.deviceComboBox.count() - 1
+        dialog.deviceComboBox.setItemData(idx, name, DEVICE_NAME_ROLE)
+
+    selected_index = -1
+    if STATE.scan_selected_address:
+        selected_index = dialog.deviceComboBox.findData(STATE.scan_selected_address)
+    if selected_index < 0 and STATE.settings is not None and STATE.settings.device_address:
+        selected_index = dialog.deviceComboBox.findData(STATE.settings.device_address)
+    if selected_index < 0:
+        selected_index = 0
+    dialog.deviceComboBox.setCurrentIndex(selected_index)
+
+
 def show_settings(settings: bytes):
     # Showing the settings UI while running prevents the run() loop from advancing.
     # Keep it simple: no settings UI while running.
@@ -368,6 +486,7 @@ def show_settings(settings: bytes):
     dialog = uic.loadUi(UI_FILE_PATH)
     STATE.settings_dialog = dialog
     fit_dialog_to_contents(dialog)
+    assert STATE.settings is not None
 
     dialog.deviceComboBox.setPlaceholderText("No Polar devices found")
     dialog.batchSizeSpinBox.setValue(STATE.settings.batch_size)
@@ -382,100 +501,13 @@ def show_settings(settings: bytes):
         )
         current_index = dialog.samplingRateComboBox.findData(STATE.settings.sampling_rate)
     dialog.samplingRateComboBox.setCurrentIndex(current_index)
-
-    scan_state = {
-        "thread": None,
-        "worker": None,
-        "selected_address": STATE.settings.device_address,
-    }
-
-    def set_scanning_ui(scanning: bool):
-        dialog.deviceComboBox.setEnabled(not scanning)
-        dialog.refreshDevicesButton.setEnabled(not scanning)
-        if scanning:
-            dialog.deviceComboBox.clear()
-            dialog.deviceComboBox.setPlaceholderText("Scanning...")
-            dialog.refreshDevicesButton.setToolTip("Scanning for Polar devices...")
-        else:
-            dialog.refreshDevicesButton.setToolTip("Scan again")
-
-    def finish_scan(entries: list[tuple[str, str]], error_text: str):
-        dialog.deviceComboBox.clear()
-        if error_text:
-            dialog.deviceComboBox.setPlaceholderText(error_text)
-            return
-        if not entries:
-            dialog.deviceComboBox.setPlaceholderText("No Polar devices found")
-            return
-
-        for name, address in entries:
-            dialog.deviceComboBox.addItem(f"{name} ({address})", address)
-            idx = dialog.deviceComboBox.count() - 1
-            dialog.deviceComboBox.setItemData(idx, name, DEVICE_NAME_ROLE)
-
-        selected_index = -1
-        selected_address = scan_state["selected_address"]
-        if isinstance(selected_address, str) and selected_address:
-            selected_index = dialog.deviceComboBox.findData(selected_address)
-        if selected_index < 0 and STATE.settings.device_address:
-            selected_index = dialog.deviceComboBox.findData(STATE.settings.device_address)
-        if selected_index < 0:
-            selected_index = 0
-        dialog.deviceComboBox.setCurrentIndex(selected_index)
-
-    def cleanup_scan_thread():
-        scan_state["thread"] = None
-        scan_state["worker"] = None
-        set_scanning_ui(False)
-
-    def persist_settings():
-        assert STATE.settings is not None
-        address = dialog.deviceComboBox.currentData()
-        name = dialog.deviceComboBox.currentData(DEVICE_NAME_ROLE)
-        if isinstance(address, str) and address.strip():
-            STATE.settings.device_address = address.strip()
-            STATE.settings.device_name = name.strip() if isinstance(name, str) else ""
-        sampling_rate = dialog.samplingRateComboBox.currentData()
-        if sampling_rate is not None:
-            STATE.settings.sampling_rate = int(sampling_rate)
-        STATE.settings.batch_size = dialog.batchSizeSpinBox.value()
-        save_current_settings()
-
-    def cleanup_dialog():
-        STATE.settings_dialog = None
-
-    def start_scan():
-        thread = scan_state["thread"]
-        if isinstance(thread, QThread) and thread.isRunning():
-            return
-
-        current_address = dialog.deviceComboBox.currentData()
-        if isinstance(current_address, str) and current_address:
-            scan_state["selected_address"] = current_address
-        else:
-            scan_state["selected_address"] = STATE.settings.device_address
-
-        set_scanning_ui(True)
-        worker = DeviceScanWorker()
-        thread = QThread()
-        worker.moveToThread(thread)
-
-        worker.scan_done.connect(finish_scan)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(cleanup_scan_thread)
-        thread.started.connect(worker.run)
-
-        scan_state["thread"] = thread
-        scan_state["worker"] = worker
-        thread.start()
+    STATE.scan_selected_address = STATE.settings.device_address
 
     dialog.refreshDevicesButton.clicked.connect(start_scan)
     dialog.deviceComboBox.currentIndexChanged.connect(persist_settings)
     dialog.samplingRateComboBox.currentIndexChanged.connect(persist_settings)
     dialog.batchSizeSpinBox.valueChanged.connect(persist_settings)
-    dialog.finished.connect(cleanup_dialog)
+    dialog.finished.connect(cleanup_settings_dialog)
     if STATE.settings.device_address.strip():
         saved_name = STATE.settings.device_name.strip() or "Saved Polar device"
         saved_address = STATE.settings.device_address.strip()
