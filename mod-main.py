@@ -203,6 +203,7 @@ def cleanup():
         syl.println("No client to disconnect, skipping client.disconnect()")
         return
 
+    # TODO: check the device is still connected
 
     try:
         loop.run_until_complete(stop_streaming())
