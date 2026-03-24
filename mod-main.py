@@ -198,15 +198,16 @@ def cleanup():
         syl.println("No event loop to cleanup, skipping cleanup()")
         return
 
-    try:
-        loop.run_until_complete(stop_streaming())
-    except Exception as exc:
-        syl.println(f"Stop streaming failed: {exc.__class__.__name__}({exc})")
-
     client = STATE.client
     if client is None:
         syl.println("No client to disconnect, skipping client.disconnect()")
         return
+
+
+    try:
+        loop.run_until_complete(stop_streaming())
+    except Exception as exc:
+        syl.println(f"Stop streaming failed: {exc.__class__.__name__}({exc})")
 
     try:
         loop.run_until_complete(client.disconnect())
