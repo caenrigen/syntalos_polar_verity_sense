@@ -57,6 +57,7 @@ class TimedPolarMeasurementData(PolarMeasurementData):
         return response
 
     async def _pmd_data_handler(self, characteristic, data: bytearray):
+        received_ns = perf_counter_ns()
         meas = self.measurement_types[data[0]]
         timestamp = int.from_bytes(data[1:9], "little", signed=False)
         frametype = data[9]
@@ -68,7 +69,6 @@ class TimedPolarMeasurementData(PolarMeasurementData):
             timestamp += self._time_offset
 
         if meas == "PPG" and frametype == 128:
-            received_ns = perf_counter_ns()
             payload = self._decode_ppg_data(data)
             if payload and not self.first_packet_future.done():
                 self.first_packet_future.set_result(
@@ -122,7 +122,9 @@ async def run_trial(
     timeout_s: float,
     sample_rate: int,
 ) -> TrialResult:
-    first_packet_future: asyncio.Future[FirstPacketObservation] = asyncio.get_running_loop().create_future()
+    first_packet_future: asyncio.Future[FirstPacketObservation] = (
+        asyncio.get_running_loop().create_future()
+    )
     client = BleakClient(mac_address)
     pmd: TimedPolarMeasurementData | None = None
 
@@ -208,13 +210,14 @@ async def run_trials(
         return 1
 
     latencies_ms = [result.latency_ns / 1_000_000 for result in results]
+    mean_ms = mean(latencies_ms)
+    latencies_ms = [l - mean_ms for l in latencies_ms]
     first_packet_sizes = [result.samples_in_first_packet for result in results]
 
     click.echo(f"Successful trials: {len(results)}/{trials}")
     click.echo(
         "Latency summary [ms]: "
         f"min={min(latencies_ms):.3f} "
-        f"mean={mean(latencies_ms):.3f} "
         f"median={median(latencies_ms):.3f} "
         f"max={max(latencies_ms):.3f}"
         + (f" stdev={stdev(latencies_ms):.3f}" if len(latencies_ms) > 1 else "")
