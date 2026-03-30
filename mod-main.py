@@ -238,6 +238,7 @@ out.set_metadata_value("data_unit", ["raw", "raw", "raw", "raw"])
 
 def prepare():
     clear_state()
+    save_current_settings()
     close_settings_dialog()
     if STATE.settings is None:
         syl.println("Settings not set, aborting prepare()")
