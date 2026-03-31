@@ -272,33 +272,36 @@ def start():
     loop.run_until_complete(start_ppg_streaming())
 
 
-def run():
+def run() -> None:
     STATE.running = True
-    loop = STATE.loop
-    ppg_queue = STATE.ppg_queue
-    assert loop is not None
-    assert ppg_queue is not None
+    assert STATE.loop is not None
+    assert STATE.ppg_queue is not None
+    assert STATE.client is not None
 
     timestamps_us: list[int] = []
     rows: list[list[int]] = []
     try:
         while not STATE.stop_requested and syl.is_running():
             # Give the async loop a chance to advance
-            loop.run_until_complete(asyncio.sleep(0.010))
+            STATE.loop.run_until_complete(asyncio.sleep(0.010))
             while True:
                 try:
-                    frame = ppg_queue.get_nowait()
+                    frame = STATE.ppg_queue.get_nowait()
                     process_ppg_frame(frame, timestamps_us, rows)
                 except asyncio.QueueEmpty:
                     break
+            if not STATE.client.is_connected:
+                # Polar devices sometimes disconnect unexpectedly.
+                # Distance to the receiver seemed to be one of the causes.
+                raise RuntimeError("Device disconnected")
             syl.wait(1)  # ms
     except Exception as exc:
         msg = f"Run failed: {exc.__class__.__name__}({exc})"
         syl.println(msg)
         syl.raise_error(msg)
-    finally:
-        cleanup()
-        STATE.running = False
+
+    cleanup()
+    STATE.running = False
 
 
 def stop():
