@@ -46,7 +46,7 @@ class State:
     client: BleakClient | None = None
     pmd: PolarMeasurementData | None = None
     ppg_queue: asyncio.Queue | None = None
-    t0_ns: int | None = None
+    offset_ns: int | None = None
 
 
 def clear_state():
@@ -57,7 +57,7 @@ def clear_state():
     STATE.client = None
     STATE.ppg_queue = None
     STATE.pmd = None
-    STATE.t0_ns = None
+    STATE.offset_ns = None
 
 
 STATE: State = State()
@@ -165,6 +165,7 @@ def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
 
 
 def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
+    assert STATE.settings is not None
     dtype, frame_timestamp_ns, payload = frame
     if dtype != "PPG":
         syl.println(f"Expected PPG frame, got {dtype}")
@@ -174,18 +175,24 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
         return
 
     n_samples = len(payload)
-    if STATE.t0_ns is None:
+    if STATE.offset_ns is None:
         first_offset_ns = (
             (n_samples - 1) * NS_PER_SEC + STATE.settings.sampling_rate // 2
         ) // STATE.settings.sampling_rate
-        STATE.t0_ns = frame_timestamp_ns - first_offset_ns
+        # We add the offset to the timestamp of each data point.
+        # -frame_timestamp_ns: first frame is our "zero"
+        # -first_offset_ns: the timestamp of the batch corresponds to the last data point, our offset is for the first sample
+        # +syl.time_since_start_usec(): transparently report the delay of the first datapoint
+        STATE.offset_ns = (
+            -frame_timestamp_ns - first_offset_ns + int(syl.time_since_start_usec()) * 1000
+        )
 
     for back_idx, sample in zip(range(n_samples - 1, -1, -1), payload):
         ts_ns = frame_timestamp_ns - (
             (back_idx * NS_PER_SEC + STATE.settings.sampling_rate // 2)
             // STATE.settings.sampling_rate
         )
-        timestamps_us.append((ts_ns - STATE.t0_ns) // 1_000)
+        timestamps_us.append((ts_ns + STATE.offset_ns) // 1_000)
         rows.append([int(sample[0]), int(sample[1]), int(sample[2]), int(sample[3])])
 
     if len(timestamps_us) >= STATE.settings.batch_size:
