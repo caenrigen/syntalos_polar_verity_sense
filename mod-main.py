@@ -8,10 +8,40 @@ import traceback
 import numpy as np
 from bleak import BleakScanner, BleakClient
 from bleak.backends.device import BLEDevice
-from bleakheart import PolarMeasurementData
+from bleakheart import PolarMeasurementData as PolarMeasurementDataOrig
 from PyQt6 import uic
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QDialog, QLayout
+
+import time
+
+
+class PolarMeasurementData(PolarMeasurementDataOrig):
+    async def _pmd_ctrl_request(self, request: bytearray):
+        """Sends a control request to the PMD control point. Awaits the
+        response with a timeout of 10 seconds."""
+        # time to start notifications if not done yet
+        if not self._notifications_started:
+            await self._start_notifications()
+        # make sure no other request can be made to ctrl point until
+        # it  has responded.
+        async with self._ctrl_lock:
+            t0 = time.perf_counter_ns()
+            self._ctrl_recv.clear()
+            t_clear = (time.perf_counter_ns() - t0) // 1_000_000
+
+            t0 = time.perf_counter_ns()
+            await self.client.write_gatt_char(self.PMDCTRLPOINT, request)
+            t_write_gatt = (time.perf_counter_ns() - t0) // 1_000_000
+
+            t0 = time.perf_counter_ns()
+            await asyncio.wait_for(self._ctrl_recv.wait(), timeout=10)
+            t_ctrl_receive = (time.perf_counter_ns() - t0) // 1_000_000
+
+            # grab response before releasing lock
+            response = self._ctrl_response
+            syl.println(f"{t_clear = }, {t_write_gatt = }, {t_ctrl_receive = }, {request.hex() = }")
+        return response
 
 
 def handle_fatal_exc(exc: Exception, syntalos_raise: bool, clean: bool, prefix: str = ""):
