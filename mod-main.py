@@ -167,6 +167,7 @@ def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
 def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
     assert STATE.settings is not None
     dtype, frame_timestamp_ns, payload = frame
+    assert frame_timestamp_ns > 0, f"Negative {frame_timestamp_ns = }"
     if dtype != "PPG":
         syl.println(f"Expected PPG frame, got {dtype}")
         return
@@ -192,7 +193,9 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
             (back_idx * NS_PER_SEC + STATE.settings.sampling_rate // 2)
             // STATE.settings.sampling_rate
         )
-        timestamps_us.append((ts_ns + STATE.offset_ns) // 1_000)
+        ts_us = (ts_ns + STATE.offset_ns) // 1_000
+        assert ts_ns > 0, f"Negative {ts_ns = }!"
+        timestamps_us.append(ts_us)
         rows.append([int(sample[0]), int(sample[1]), int(sample[2]), int(sample[3])])
 
     if len(timestamps_us) >= STATE.settings.batch_size:
