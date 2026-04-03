@@ -158,7 +158,7 @@ async def stop_streaming():
 def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
     block = syl.IntSignalBlock()
     block.timestamps = np.array(timestamps_us, dtype=np.uint64)
-    block.data = np.array(rows, dtype=np.int64)
+    block.data = np.array(rows, dtype=np.int32)
     out.submit(block)
     timestamps_us.clear()
     rows.clear()
