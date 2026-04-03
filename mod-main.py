@@ -3,6 +3,7 @@ import syntalos_mlink as syl
 import asyncio
 from dataclasses import dataclass, asdict
 import json
+import traceback
 
 import numpy as np
 from bleak import BleakScanner, BleakClient
@@ -11,6 +12,16 @@ from bleakheart import PolarMeasurementData
 from PyQt6 import uic
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QDialog, QLayout
+
+
+def handle_fatal_exc(exc: Exception, syntalos_raise: bool, clean: bool, prefix: str = ""):
+    msg = f"{prefix}{': ' if prefix else ''}{exc.__class__.__name__}({exc})"
+    syl.println(f"{msg}\n{traceback.format_exc()}")
+    if clean:
+        cleanup()
+    if syntalos_raise:
+        syl.raise_error(msg)
+
 
 # Path to the UI file (same directory as this script)
 UI_FILE_PATH = "settings.ui"
@@ -46,6 +57,7 @@ class State:
     client: BleakClient | None = None
     pmd: PolarMeasurementData | None = None
     ppg_queue: asyncio.Queue | None = None
+    offset_start_us: int | None = None
     offset_ns: int | None = None
 
 
@@ -58,6 +70,7 @@ def clear_state():
     STATE.ppg_queue = None
     STATE.pmd = None
     STATE.offset_ns = None
+    STATE.offset_start_us = None
 
 
 STATE: State = State()
@@ -120,19 +133,18 @@ async def ensure_not_streaming(pmd: PolarMeasurementData, measurement: str):
 
 
 async def start_sdk_mode():
-    pmd = STATE.pmd
-    assert pmd is not None
-    await ensure_not_streaming(pmd, "PPG")
-    await ensure_not_streaming(pmd, "SDK")
-    err_code, err_msg, _ = await pmd.start_streaming("SDK")
+    assert STATE.pmd is not None
+    await ensure_not_streaming(STATE.pmd, "PPG")
+    await ensure_not_streaming(STATE.pmd, "SDK")
+    err_code, err_msg, _ = await STATE.pmd.start_streaming("SDK")
     if err_code != 0:
         raise RuntimeError(f"Failed to start SDK mode: {err_code} {err_msg}")
 
 
 async def start_ppg_streaming():
-    pmd = STATE.pmd
-    assert pmd is not None
-    err_code, err_msg, _ = await pmd.start_streaming(
+    assert STATE.pmd is not None
+    assert STATE.settings is not None
+    err_code, err_msg, _ = await STATE.pmd.start_streaming(
         "PPG",
         sample_rate=STATE.settings.sampling_rate,
         resolution=STATE.settings.resolution,
@@ -166,6 +178,7 @@ def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
 
 def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
     assert STATE.settings is not None
+    assert STATE.offset_start_us is not None
     dtype, frame_timestamp_ns, payload = frame
     assert frame_timestamp_ns > 0, f"Negative {frame_timestamp_ns = }"
     if dtype != "PPG":
@@ -177,16 +190,15 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
 
     n_samples = len(payload)
     if STATE.offset_ns is None:
-        first_offset_ns = (
+        offset_1st_sample = (
             (n_samples - 1) * NS_PER_SEC + STATE.settings.sampling_rate // 2
         ) // STATE.settings.sampling_rate
         # We add the offset to the timestamp of each data point.
-        # -frame_timestamp_ns: first frame is our "zero"
-        # -first_offset_ns: the timestamp of the batch corresponds to the last data point, our offset is for the first sample
-        # +syl.time_since_start_usec(): transparently report the delay of the first datapoint
-        STATE.offset_ns = (
-            -frame_timestamp_ns - first_offset_ns + int(syl.time_since_start_usec()) * 1000
-        )
+        # frame_timestamp_ns: first frame is our "zero"
+        # offset_1st_sample: the timestamp of the batch corresponds to the last data point, offset to first sample
+        # syl.time_since_start_usec(): transparently report the delay of the first datapoint
+        syl.println(f"{STATE.offset_start_us = }")
+        STATE.offset_ns = -(frame_timestamp_ns - offset_1st_sample) + STATE.offset_start_us * 1000
 
     for back_idx, sample in zip(range(n_samples - 1, -1, -1), payload):
         ts_ns = frame_timestamp_ns - (
@@ -194,7 +206,7 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
             // STATE.settings.sampling_rate
         )
         ts_us = (ts_ns + STATE.offset_ns) // 1_000
-        assert ts_ns > 0, f"Negative {ts_ns = }!"
+        assert ts_us > 0, f"Negative {ts_us = }!"
         timestamps_us.append(ts_us)
         rows.append([int(sample[0]), int(sample[1]), int(sample[2]), int(sample[3])])
 
@@ -270,16 +282,18 @@ def prepare():
         loop.run_until_complete(start_sdk_mode())
         return True
     except Exception as exc:
-        msg = f"Prepare failed: {exc.__class__.__name__}({exc})"
-        syl.println(msg)
-        cleanup()
-        syl.raise_error(msg)
+        handle_fatal_exc(exc, syntalos_raise=True, clean=True, prefix="Prepare failed")
+        return False
 
 
 def start():
-    loop = STATE.loop
-    assert loop is not None
-    loop.run_until_complete(start_ppg_streaming())
+    assert STATE.loop is not None
+    try:
+        # ts_us_before = syl.time_since_start_usec() # returns ~300 us at this point
+        STATE.loop.run_until_complete(start_ppg_streaming())
+        STATE.offset_start_us = int(syl.time_since_start_usec())
+    except Exception as exc:
+        handle_fatal_exc(exc, syntalos_raise=True, clean=True, prefix="Start failed")
 
 
 def run() -> None:
@@ -305,12 +319,10 @@ def run() -> None:
                 # Distance to the receiver seemed to be one of the causes.
                 raise RuntimeError("Device disconnected")
             syl.wait(1)  # ms
+        cleanup()
     except Exception as exc:
-        msg = f"Run failed: {exc.__class__.__name__}({exc})"
-        syl.println(msg)
-        syl.raise_error(msg)
+        handle_fatal_exc(exc, syntalos_raise=True, clean=True, prefix="Run failed")
 
-    cleanup()
     STATE.running = False
 
 
