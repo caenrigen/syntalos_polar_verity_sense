@@ -3,6 +3,7 @@ import syntalos_mlink as syl
 import asyncio
 from dataclasses import dataclass, asdict
 import json
+import traceback
 
 import numpy as np
 from bleak import BleakScanner, BleakClient
@@ -11,6 +12,16 @@ from bleakheart import PolarMeasurementData
 from PyQt6 import uic
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QDialog, QLayout
+
+
+def handle_fatal_exc(exc: Exception, syntalos_raise: bool, clean: bool, prefix: str = ""):
+    msg = f"{prefix}{': ' if prefix else ''}{exc.__class__.__name__}({exc})"
+    syl.println(f"{msg}\n{traceback.format_exc()}")
+    if clean:
+        cleanup()
+    if syntalos_raise:
+        syl.raise_error(msg)
+
 
 # Path to the UI file (same directory as this script)
 UI_FILE_PATH = "settings.ui"
@@ -120,19 +131,18 @@ async def ensure_not_streaming(pmd: PolarMeasurementData, measurement: str):
 
 
 async def start_sdk_mode():
-    pmd = STATE.pmd
-    assert pmd is not None
-    await ensure_not_streaming(pmd, "PPG")
-    await ensure_not_streaming(pmd, "SDK")
-    err_code, err_msg, _ = await pmd.start_streaming("SDK")
+    assert STATE.pmd is not None
+    await ensure_not_streaming(STATE.pmd, "PPG")
+    await ensure_not_streaming(STATE.pmd, "SDK")
+    err_code, err_msg, _ = await STATE.pmd.start_streaming("SDK")
     if err_code != 0:
         raise RuntimeError(f"Failed to start SDK mode: {err_code} {err_msg}")
 
 
 async def start_ppg_streaming():
-    pmd = STATE.pmd
-    assert pmd is not None
-    err_code, err_msg, _ = await pmd.start_streaming(
+    assert STATE.pmd is not None
+    assert STATE.settings is not None
+    err_code, err_msg, _ = await STATE.pmd.start_streaming(
         "PPG",
         sample_rate=STATE.settings.sampling_rate,
         resolution=STATE.settings.resolution,
@@ -270,16 +280,18 @@ def prepare():
         loop.run_until_complete(start_sdk_mode())
         return True
     except Exception as exc:
-        msg = f"Prepare failed: {exc.__class__.__name__}({exc})"
-        syl.println(msg)
-        cleanup()
-        syl.raise_error(msg)
+        handle_fatal_exc(exc, syntalos_raise=True, clean=True, prefix="Prepare failed")
+        return False
 
 
 def start():
-    loop = STATE.loop
-    assert loop is not None
-    loop.run_until_complete(start_ppg_streaming())
+    assert STATE.loop is not None
+    try:
+        # ts_us_before = syl.time_since_start_usec() # returns ~300 us at this point
+        STATE.loop.run_until_complete(start_ppg_streaming())
+        # STATE.offset_start_us = int(syl.time_since_start_usec())
+    except Exception as exc:
+        handle_fatal_exc(exc, syntalos_raise=True, clean=True, prefix="Start failed")
 
 
 def run() -> None:
@@ -305,12 +317,10 @@ def run() -> None:
                 # Distance to the receiver seemed to be one of the causes.
                 raise RuntimeError("Device disconnected")
             syl.wait(1)  # ms
+        cleanup()
     except Exception as exc:
-        msg = f"Run failed: {exc.__class__.__name__}({exc})"
-        syl.println(msg)
-        syl.raise_error(msg)
+        handle_fatal_exc(exc, syntalos_raise=True, clean=True, prefix="Run failed")
 
-    cleanup()
     STATE.running = False
 
 
