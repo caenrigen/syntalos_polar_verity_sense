@@ -57,6 +57,7 @@ class State:
     client: BleakClient | None = None
     pmd: PolarMeasurementData | None = None
     ppg_queue: asyncio.Queue | None = None
+    offset_start_us: int | None = None
     offset_ns: int | None = None
 
 
@@ -69,6 +70,7 @@ def clear_state():
     STATE.ppg_queue = None
     STATE.pmd = None
     STATE.offset_ns = None
+    STATE.offset_start_us = None
 
 
 STATE: State = State()
@@ -176,6 +178,7 @@ def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
 
 def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
     assert STATE.settings is not None
+    assert STATE.offset_start_us is not None
     dtype, frame_timestamp_ns, payload = frame
     assert frame_timestamp_ns > 0, f"Negative {frame_timestamp_ns = }"
     if dtype != "PPG":
@@ -187,16 +190,15 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
 
     n_samples = len(payload)
     if STATE.offset_ns is None:
-        first_offset_ns = (
+        offset_1st_sample = (
             (n_samples - 1) * NS_PER_SEC + STATE.settings.sampling_rate // 2
         ) // STATE.settings.sampling_rate
         # We add the offset to the timestamp of each data point.
-        # -frame_timestamp_ns: first frame is our "zero"
-        # -first_offset_ns: the timestamp of the batch corresponds to the last data point, our offset is for the first sample
-        # +syl.time_since_start_usec(): transparently report the delay of the first datapoint
-        STATE.offset_ns = (
-            -frame_timestamp_ns - first_offset_ns + int(syl.time_since_start_usec()) * 1000
-        )
+        # frame_timestamp_ns: first frame is our "zero"
+        # offset_1st_sample: the timestamp of the batch corresponds to the last data point, offset to first sample
+        # syl.time_since_start_usec(): transparently report the delay of the first datapoint
+        syl.println(f"{STATE.offset_start_us = }")
+        STATE.offset_ns = -(frame_timestamp_ns - offset_1st_sample) + STATE.offset_start_us * 1000
 
     for back_idx, sample in zip(range(n_samples - 1, -1, -1), payload):
         ts_ns = frame_timestamp_ns - (
@@ -204,7 +206,7 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
             // STATE.settings.sampling_rate
         )
         ts_us = (ts_ns + STATE.offset_ns) // 1_000
-        assert ts_ns > 0, f"Negative {ts_ns = }!"
+        assert ts_us > 0, f"Negative {ts_us = }!"
         timestamps_us.append(ts_us)
         rows.append([int(sample[0]), int(sample[1]), int(sample[2]), int(sample[3])])
 
