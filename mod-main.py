@@ -13,6 +13,8 @@ from PyQt6 import uic
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QDialog, QLayout
 
+syl.println("Loading Python code...")
+
 
 def handle_fatal_exc(exc: Exception, syntalos_raise: bool, clean: bool, prefix: str = ""):
     msg = f"{prefix}{': ' if prefix else ''}{exc.__class__.__name__}({exc})"
@@ -62,10 +64,18 @@ class State:
 
 
 def clear_state():
-    # Settings should stay persistent across runs
+    # STATE.settings must stay persistent across runs
+
+    # STATE.loop must stay persistent.
+    # `bleak` associates a persistent `BlueZManager()` with `asyncio.get_running_loop()`.
+    # See bleak.backends.bluezdbus.manager.get_global_bluez_manager() for details.
+    # The issue is that for some reason the `loop` is not garbage collected and leaves opened DBus
+    # connections lingering around. By default, Linux has a 256 connections limit which prevents us
+    # from running >~110 "launch sync" runs in Syntalos
+    # (x2 for two polar devices, ~220 bus connections + system connections = 256 limit).
+
     STATE.stop_requested = False
     STATE.running = False
-    STATE.loop = None
     STATE.client = None
     STATE.ppg_queue = None
     STATE.pmd = None
@@ -215,25 +225,23 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
 
 
 def cleanup():
-    loop = STATE.loop
-    if loop is None:
+    if STATE.loop is None:
         syl.println("No event loop to cleanup, skipping cleanup()")
         return
 
-    client = STATE.client
-    if client is None:
+    if STATE.client is None:
         syl.println("No client to disconnect, skipping client.disconnect()")
         return
 
     # TODO: check the device is still connected
 
     try:
-        loop.run_until_complete(stop_streaming())
+        STATE.loop.run_until_complete(stop_streaming())
     except Exception as exc:
         syl.println(f"Stop streaming failed: {exc.__class__.__name__}({exc})")
 
     try:
-        loop.run_until_complete(client.disconnect())
+        STATE.loop.run_until_complete(STATE.client.disconnect())
     except EOFError:
         # Happens sometimes but does not seem to be problematic.
         # So far I have seen it only inside a VM.
@@ -241,7 +249,10 @@ def cleanup():
     except Exception as exc:
         syl.println(f"Disconnect failed: {exc.__class__.__name__}({exc})")
 
-    loop.close()
+    # Loop must remain persistent, see clear_state()
+    # loop.close()
+
+    clear_state()
 
     # TODO: figure out how to make cleanup finish at the end of stop()
     syl.println("Cleanup complete")
@@ -259,7 +270,6 @@ out.set_metadata_value("data_unit", ["raw", "raw", "raw", "raw"])
 
 
 def prepare():
-    clear_state()
     save_current_settings()
     close_settings_dialog()
     if STATE.settings is None:
@@ -270,16 +280,20 @@ def prepare():
         raise ValueError("Device address not set, edit the settings and try again")
 
     try:
-        loop = asyncio.new_event_loop()
-        STATE.loop = loop
+        if STATE.loop is None:
+            STATE.loop = asyncio.new_event_loop()
+            syl.println("Created asyncio loop")
+        else:
+            syl.println("Reusing asyncio loop")
 
         client = BleakClient(STATE.settings.device_address)
-        loop.run_until_complete(client.connect())
+        STATE.loop.run_until_complete(client.connect())
+
         STATE.client = client
         STATE.ppg_queue = asyncio.Queue()
         STATE.pmd = PolarMeasurementData(client, ppg_queue=STATE.ppg_queue)
 
-        loop.run_until_complete(start_sdk_mode())
+        STATE.loop.run_until_complete(start_sdk_mode())
         return True
     except Exception as exc:
         handle_fatal_exc(exc, syntalos_raise=True, clean=True, prefix="Prepare failed")
