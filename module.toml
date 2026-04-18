@@ -14,12 +14,5 @@ use_venv = true
 devel = false
 
 # This will put it inside the "Device Support" group in the "Add Module" GUI
-categories = 'device'
+categories = ['device']
 features = ['show-settings']
-
-[ports]
-
-[[ports.out]]
-data_type = 'IntSignalBlock'
-id = 'packets'
-title = 'Data Packets'

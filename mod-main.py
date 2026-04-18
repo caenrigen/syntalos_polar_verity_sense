@@ -84,6 +84,7 @@ def clear_state():
 
 
 STATE: State = State()
+out: syl.OutputPort | None = None
 
 
 def serialise_settings(settings: Settings) -> bytes:
@@ -178,6 +179,7 @@ async def stop_streaming():
 
 
 def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
+    assert out is not None
     block = syl.IntSignalBlock()
     block.timestamps = np.array(timestamps_us, dtype=np.uint64)
     block.data = np.array(rows, dtype=np.int32)
@@ -263,18 +265,24 @@ def cleanup():
 # # ####################################################################################
 
 
-out = syl.get_output_port("packets")
-out.set_metadata_value("signal_names", ["PPG0", "PPG1", "PPG2", "AMBIENT"])
-out.set_metadata_value("time_unit", "microseconds")
-out.set_metadata_value("data_unit", ["raw", "raw", "raw", "raw"])
+def register_ports() -> None:
+    syl.register_output_port("packets", "Data Packets", "IntSignalBlock")
 
 
 def prepare():
+    global out
+
     save_current_settings()
     close_settings_dialog()
     if STATE.settings is None:
         syl.println("Settings not set, aborting prepare()")
         return False
+
+    out = syl.get_output_port("packets")
+    assert out is not None
+    out.set_metadata_value("signal_names", ["PPG0", "PPG1", "PPG2", "AMBIENT"])
+    out.set_metadata_value("time_unit", "microseconds")
+    out.set_metadata_value("data_unit", ["raw", "raw", "raw", "raw"])
 
     if not STATE.settings.device_address:
         raise ValueError("Device address not set, edit the settings and try again")
@@ -567,3 +575,6 @@ def show_settings(settings: bytes):
 
 
 syl.call_on_show_settings(show_settings)
+
+# Register ports at module level so Syntalos can restore project connections.
+register_ports()
