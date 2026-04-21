@@ -3,3 +3,5 @@ bleakheart==0.2.0 # depends on `bleak`
 
 # For settings GUI
 PyQt6
+
+setproctitle # required for `rename_process=True`
