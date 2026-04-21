@@ -1,36 +1,27 @@
-import syntalos_mlink as syl
-
 import asyncio
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 import json
-import traceback
+import sys
+from pathlib import Path
 
 import numpy as np
-from bleak import BleakScanner, BleakClient
+from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 from bleakheart import PolarMeasurementData
+
 from PyQt6 import uic
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtWidgets import QDialog, QLayout
+from PyQt6.QtWidgets import QApplication, QDialog, QLayout
 
-syl.println("Loading Python code...")
+import syntalos_mlink as syl
 
-
-def handle_fatal_exc(exc: Exception, syntalos_raise: bool, clean: bool, prefix: str = ""):
-    msg = f"{prefix}{': ' if prefix else ''}{exc.__class__.__name__}({exc})"
-    syl.println(f"{msg}\n{traceback.format_exc()}")
-    if clean:
-        cleanup()
-    if syntalos_raise:
-        syl.raise_error(msg)
-
-
-# Path to the UI file (same directory as this script)
-UI_FILE_PATH = "settings.ui"
+UI_FILE_PATH = Path(__file__).resolve().with_name("settings.ui")
 
 NS_PER_SEC = 1_000_000_000
 POLAR_ERR_ALREADY_IN_STATE = 6
 VALID_PPG_SAMPLE_RATES = [28, 44, 55, 135, 176]
+ASYNC_LOOP_ADVANCE_S = 0.010
+ASYNC_LOOP_WRAPUP_S = 0.100
 
 
 @dataclass
@@ -48,7 +39,6 @@ class Settings:
 @dataclass
 class State:
     settings: Settings | None = None
-    stop_requested: bool = False
     running: bool = False
     settings_dialog: QDialog | None = None
     scan_thread: QThread | None = None
@@ -61,10 +51,12 @@ class State:
     ppg_queue: asyncio.Queue | None = None
     offset_start_us: int | None = None
     offset_ns: int | None = None
+    ppg_timestamps_us: list[int] = field(default_factory=list)
+    ppg_rows: list[list[int]] = field(default_factory=list)
 
 
-def clear_state():
-    # STATE.settings must stay persistent across runs
+def clear_state() -> None:
+    # STATE.settings must stay persistent across runs.
 
     # STATE.loop must stay persistent.
     # `bleak` associates a persistent `BlueZManager()` with `asyncio.get_running_loop()`.
@@ -74,16 +66,19 @@ def clear_state():
     # from running >~110 "launch sync" runs in Syntalos
     # (x2 for two polar devices, ~220 bus connections + system connections = 256 limit).
 
-    STATE.stop_requested = False
     STATE.running = False
     STATE.client = None
     STATE.ppg_queue = None
     STATE.pmd = None
     STATE.offset_ns = None
     STATE.offset_start_us = None
+    STATE.ppg_timestamps_us.clear()
+    STATE.ppg_rows.clear()
 
 
-STATE: State = State()
+STATE = State()
+App: QApplication | None = None
+MLink: syl.SyntalosLink | None = None
 out: syl.OutputPort | None = None
 
 
@@ -95,15 +90,10 @@ def deserialise_settings(settings: bytes) -> Settings:
     return Settings(**json.loads(settings.decode()))  # pyright: ignore[reportAny]
 
 
-def save_current_settings() -> None:
-    assert STATE.settings is not None
-    syl.save_settings(serialise_settings(STATE.settings))
-
-
 def close_settings_dialog() -> None:
     dialog = STATE.settings_dialog
     if dialog is not None:
-        dialog.close()
+        _ = dialog.close()
 
 
 def fit_dialog_to_contents(dialog: QDialog) -> None:
@@ -140,7 +130,7 @@ async def ensure_not_streaming(pmd: PolarMeasurementData, measurement: str):
     if err_code not in (0, POLAR_ERR_ALREADY_IN_STATE):
         raise RuntimeError(f"Failed to stop {measurement} before restart: {err_code} {err_msg}")
     if err_code == 0:
-        syl.println(f"Stopped existing {measurement} stream/state before start")
+        print(f"Stopped existing {measurement} stream/state before start")
 
 
 async def start_sdk_mode():
@@ -171,14 +161,14 @@ async def stop_streaming():
     try:
         await pmd.stop_streaming("PPG")
     except Exception as exc:
-        syl.println(f"PPG stop failed: {exc.__class__.__name__}({exc})")
+        print(f"PPG stop failed: {exc.__class__.__name__}({exc})")
     try:
         await pmd.stop_streaming("SDK")
     except Exception as exc:
-        syl.println(f"SDK stop failed: {exc.__class__.__name__}({exc})")
+        print(f"SDK stop failed: {exc.__class__.__name__}({exc})")
 
 
-def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
+def submit_batch(timestamps_us: list[int], rows: list[list[int]]) -> None:
     assert out is not None
     block = syl.IntSignalBlock()
     block.timestamps = np.array(timestamps_us, dtype=np.uint64)
@@ -188,16 +178,16 @@ def submit_batch(timestamps_us: list[int], rows: list[list[int]]):
     rows.clear()
 
 
-def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
+def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]) -> None:
     assert STATE.settings is not None
     assert STATE.offset_start_us is not None
     dtype, frame_timestamp_ns, payload = frame
     assert frame_timestamp_ns > 0, f"Negative {frame_timestamp_ns = }"
     if dtype != "PPG":
-        syl.println(f"Expected PPG frame, got {dtype}")
+        print(f"Expected PPG frame, got {dtype}")
         return
     if not payload:
-        syl.println("Empty PPG frame")
+        print("Empty PPG frame")
         return
 
     n_samples = len(payload)
@@ -209,7 +199,7 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
         # frame_timestamp_ns: first frame is our "zero"
         # offset_1st_sample: the timestamp of the batch corresponds to the last data point, offset to first sample
         # syl.time_since_start_usec(): transparently report the delay of the first datapoint
-        syl.println(f"{STATE.offset_start_us = }")
+        print(f"{STATE.offset_start_us = }")
         STATE.offset_ns = -(frame_timestamp_ns - offset_1st_sample) + STATE.offset_start_us * 1000
 
     for back_idx, sample in zip(range(n_samples - 1, -1, -1), payload):
@@ -226,38 +216,38 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]):
         submit_batch(timestamps_us, rows)
 
 
-def cleanup():
-    if STATE.loop is None:
-        syl.println("No event loop to cleanup, skipping cleanup()")
+def cleanup() -> None:
+    loop = STATE.loop
+    if loop is None:
+        print("No event loop to cleanup, skipping cleanup()")
         return
 
-    if STATE.client is None:
-        syl.println("No client to disconnect, skipping client.disconnect()")
+    client = STATE.client
+    if client is None:
+        print("No client to disconnect, skipping client.disconnect()")
         return
-
-    # TODO: check the device is still connected
 
     try:
-        STATE.loop.run_until_complete(stop_streaming())
+        loop.run_until_complete(stop_streaming())
+        # Advance the async loop a final bit for all pending tasks to wrap up.
+        # This pervents a series of errors being printed when quiting Syntalos.
+        loop.run_until_complete(asyncio.sleep(ASYNC_LOOP_WRAPUP_S))
     except Exception as exc:
-        syl.println(f"Stop streaming failed: {exc.__class__.__name__}({exc})")
+        print(f"Stop streaming failed: {exc.__class__.__name__}({exc})")
 
     try:
-        STATE.loop.run_until_complete(STATE.client.disconnect())
+        loop.run_until_complete(client.disconnect())
+        # Advance the async loop a final bit for all pending tasks to wrap up.
+        # This pervents a series of errors being printed when quiting Syntalos.
+        loop.run_until_complete(asyncio.sleep(ASYNC_LOOP_WRAPUP_S))
     except EOFError:
         # Happens sometimes but does not seem to be problematic.
         # So far I have seen it only inside a VM.
-        syl.println("EOFError at client.disconnect()")
+        print("EOFError at client.disconnect()")
     except Exception as exc:
-        syl.println(f"Disconnect failed: {exc.__class__.__name__}({exc})")
+        print(f"Disconnect failed: {exc.__class__.__name__}({exc})")
 
-    # Loop must remain persistent, see clear_state()
-    # loop.close()
-
-    clear_state()
-
-    # TODO: figure out how to make cleanup finish at the end of stop()
-    syl.println("Cleanup complete")
+    print("Cleanup complete")
 
 
 # # ####################################################################################
@@ -265,20 +255,20 @@ def cleanup():
 # # ####################################################################################
 
 
-def register_ports() -> None:
-    syl.register_output_port("packets", "Data Packets", "IntSignalBlock")
+def register_ports(mlink: syl.SyntalosLink) -> None:
+    global out
+
+    out = mlink.register_output_port("packets", "Data Packets", syl.DataType.IntSignalBlock)
+    assert out is not None
 
 
 def prepare():
-    global out
-
-    save_current_settings()
+    clear_state()
     close_settings_dialog()
     if STATE.settings is None:
-        syl.println("Settings not set, aborting prepare()")
+        print("Settings not set, aborting prepare()")
         return False
 
-    out = syl.get_output_port("packets")
     assert out is not None
     out.set_metadata_value("signal_names", ["PPG0", "PPG1", "PPG2", "AMBIENT"])
     out.set_metadata_value("time_unit", "microseconds")
@@ -287,85 +277,82 @@ def prepare():
     if not STATE.settings.device_address:
         raise ValueError("Device address not set, edit the settings and try again")
 
-    try:
-        if STATE.loop is None:
-            STATE.loop = asyncio.new_event_loop()
-            syl.println("Created asyncio loop")
-        else:
-            syl.println("Reusing asyncio loop")
+    if STATE.loop is None:
+        STATE.loop = asyncio.new_event_loop()
 
-        client = BleakClient(STATE.settings.device_address)
-        STATE.loop.run_until_complete(client.connect())
+    client = BleakClient(STATE.settings.device_address)
+    STATE.loop.run_until_complete(client.connect())
 
-        STATE.client = client
-        STATE.ppg_queue = asyncio.Queue()
-        STATE.pmd = PolarMeasurementData(client, ppg_queue=STATE.ppg_queue)
+    STATE.client = client
+    STATE.ppg_queue = asyncio.Queue()
+    STATE.pmd = PolarMeasurementData(client, ppg_queue=STATE.ppg_queue)
 
-        STATE.loop.run_until_complete(start_sdk_mode())
-        return True
-    except Exception as exc:
-        handle_fatal_exc(exc, syntalos_raise=True, clean=True, prefix="Prepare failed")
-        return False
+    STATE.loop.run_until_complete(start_sdk_mode())
+    return True
 
 
-def start():
+def start() -> None:
     assert STATE.loop is not None
-    try:
-        # ts_us_before = syl.time_since_start_usec() # returns ~300 us at this point
-        STATE.loop.run_until_complete(start_ppg_streaming())
-        STATE.offset_start_us = int(syl.time_since_start_usec())
-    except Exception as exc:
-        handle_fatal_exc(exc, syntalos_raise=True, clean=True, prefix="Start failed")
-
-
-def run() -> None:
+    # ts_us_before = syl.time_since_start_usec() # returns ~300 us at this point
+    STATE.loop.run_until_complete(start_ppg_streaming())
+    STATE.offset_start_us = int(syl.time_since_start_usec())
     STATE.running = True
-    assert STATE.loop is not None
-    assert STATE.ppg_queue is not None
-    assert STATE.client is not None
-
-    timestamps_us: list[int] = []
-    rows: list[list[int]] = []
-    try:
-        while not STATE.stop_requested and syl.is_running():
-            # Give the async loop a chance to advance
-            STATE.loop.run_until_complete(asyncio.sleep(0.010))
-            while True:
-                try:
-                    frame = STATE.ppg_queue.get_nowait()
-                    process_ppg_frame(frame, timestamps_us, rows)
-                except asyncio.QueueEmpty:
-                    break
-            if not STATE.client.is_connected:
-                # Polar devices sometimes disconnect unexpectedly.
-                # Distance to the receiver seemed to be one of the causes.
-                raise RuntimeError("Device disconnected")
-            syl.wait(1)  # ms
-        cleanup()
-    except Exception as exc:
-        handle_fatal_exc(exc, syntalos_raise=True, clean=True, prefix="Run failed")
-
-    STATE.running = False
 
 
-def stop():
-    STATE.stop_requested = True
-    # In case other modules trigger a premature stop(), we need to call cleanup() here
+def event_loop_tick() -> None:
+    if App is not None:
+        App.processEvents()
+
+    loop = STATE.loop
+    if loop is None:
+        return
+
+    loop.run_until_complete(asyncio.sleep(ASYNC_LOOP_ADVANCE_S))
+
     if not STATE.running:
-        cleanup()
+        return
 
+    ppg_queue = STATE.ppg_queue
+    client = STATE.client
+    assert ppg_queue is not None
+    assert client is not None
 
-def set_settings(settings: bytes):
-    if settings:
+    while True:
         try:
-            STATE.settings = deserialise_settings(settings)
-        except Exception as exc:
-            msg = f"Failed to parse settings: {exc.__class__.__name__}({exc})"
-            syl.println(msg)
-            syl.raise_error(msg)
+            frame = ppg_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        process_ppg_frame(frame, STATE.ppg_timestamps_us, STATE.ppg_rows)
+
+    if not client.is_connected:
+        # Polar devices sometimes disconnect unexpectedly.
+        # Distance to the Bluetooth receiver seemed to be one of the causes.
+        raise RuntimeError("Device disconnected")
+
+
+def stop() -> None:
+    STATE.running = False
+    cleanup()
+
+
+def load_settings(settings: bytes, _base_dir: Path) -> bool:
+    if not settings:
+        if STATE.settings is None:
             STATE.settings = Settings()
-    elif STATE.settings is None:
+        return True
+
+    try:
+        STATE.settings = deserialise_settings(settings)
+        return True
+    except Exception:
         STATE.settings = Settings()
+        raise
+
+
+def save_settings(_base_dir: Path) -> bytes:
+    if STATE.settings is None:
+        STATE.settings = Settings()
+    return serialise_settings(STATE.settings)
 
 
 # # ####################################################################################
@@ -393,7 +380,7 @@ class DeviceScanWorker(QObject):
                 entries.append((name, dev.address))
         except Exception as exc:
             error_text = "Scan failed, check logs"
-            syl.println(f"Polar scan failed: {exc.__class__.__name__}({exc})")
+            print(f"Polar scan failed: {exc.__class__.__name__}({exc})")
         self.scan_done.emit(entries, error_text)
         self.finished.emit()
 
@@ -431,7 +418,6 @@ def persist_settings() -> None:
     if sampling_rate is not None:
         STATE.settings.sampling_rate = int(sampling_rate)
     STATE.settings.batch_size = dialog.batchSizeSpinBox.value()
-    save_current_settings()
 
 
 def cleanup_settings_dialog(_result: int) -> None:
@@ -513,18 +499,15 @@ def finish_scan(entries: list[tuple[str, str]], error_text: str) -> None:
     dialog.deviceComboBox.setCurrentIndex(selected_index)
 
 
-def show_settings(settings: bytes):
-    # Showing the settings UI while running prevents the run() loop from advancing.
+def show_settings() -> None:
+    # Showing the settings UI while running prevents the module event loop from advancing.
     # Keep it simple: no settings UI while running.
-    if STATE.running or syl.is_running():
-        syl.println("Cannot show settings while running")
+    if STATE.running or (MLink is not None and MLink.is_running):
+        print("Cannot show settings while running")
         return
 
-    if not settings:
-        if STATE.settings is None:
-            STATE.settings = Settings()
-    else:
-        STATE.settings = deserialise_settings(settings)
+    if STATE.settings is None:
+        STATE.settings = Settings()
 
     dialog = STATE.settings_dialog
     if dialog is not None:
@@ -571,10 +554,26 @@ def show_settings(settings: bytes):
     dialog.show()
     dialog.raise_()
     dialog.activateWindow()
-    dialog.exec()
 
 
-syl.call_on_show_settings(show_settings)
+def main() -> int:
+    global App, MLink
 
-# Register ports at module level so Syntalos can restore project connections.
-register_ports()
+    App = QApplication(sys.argv)
+    App.setQuitOnLastWindowClosed(False)
+    MLink = syl.init_link(rename_process=True)
+    register_ports(MLink)
+    MLink.on_prepare = prepare
+    MLink.on_start = start
+    MLink.on_stop = stop
+    MLink.on_show_settings = show_settings
+    MLink.on_save_settings = save_settings
+    MLink.on_load_settings = load_settings
+    MLink.await_data_forever(event_loop_tick)
+    if STATE.running:
+        cleanup()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
