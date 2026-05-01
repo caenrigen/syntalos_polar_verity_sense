@@ -5,7 +5,7 @@ name = "Polar Verity Sense"
 description = "Streams data from a Polar Verity Sense device."
 icon = "polar-logo.svg"
 
-main = "mod-main.py"
+main = "module.py"
 # will run the module in a dedicated venv with requirements.txt installed
 use_venv = true
 
