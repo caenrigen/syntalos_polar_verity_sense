@@ -40,6 +40,7 @@ class Settings:
 class State:
     settings: Settings | None = None
     running: bool = False
+    cleanup_requested: bool = False
     settings_dialog: QDialog | None = None
     scan_thread: QThread | None = None
     scan_worker: QObject | None = None
@@ -217,6 +218,7 @@ def process_ppg_frame(frame, timestamps_us: list[int], rows: list[list[int]]) ->
 
 
 def cleanup() -> None:
+    STATE.cleanup_requested = False
     loop = STATE.loop
     if loop is None:
         print("No event loop to cleanup, skipping cleanup()")
@@ -263,6 +265,8 @@ def register_ports(mlink: syl.SyntalosLink) -> None:
 
 
 def prepare():
+    if STATE.cleanup_requested:
+        cleanup()
     clear_state()
     close_settings_dialog()
     if STATE.settings is None:
@@ -303,6 +307,9 @@ def event_loop_tick() -> None:
     if App is not None:
         App.processEvents()
 
+    if STATE.cleanup_requested:
+        cleanup()
+
     loop = STATE.loop
     if loop is None:
         return
@@ -332,7 +339,7 @@ def event_loop_tick() -> None:
 
 def stop() -> None:
     STATE.running = False
-    cleanup()
+    STATE.cleanup_requested = True
 
 
 def load_settings(settings: bytes, _base_dir: Path) -> bool:
